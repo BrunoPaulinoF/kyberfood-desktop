@@ -1,0 +1,39 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="KyberFood Impressão">
+  <defs>
+    <linearGradient id="kf-badge" x1="40" y1="24" x2="472" y2="488" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF8A4C"/>
+      <stop offset="0.55" stop-color="#FF6B35"/>
+      <stop offset="1" stop-color="#F5511B"/>
+    </linearGradient>
+    <linearGradient id="kf-ink" x1="256" y1="150" x2="256" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF7B41"/>
+      <stop offset="1" stop-color="#F5551C"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Selo laranja, no mesmo estilo do favicon do painel -->
+  <rect width="512" height="512" rx="132" fill="url(#kf-badge)"/>
+
+  <!-- Papel entrando por cima da impressora -->
+  <rect x="198" y="120" width="116" height="58" rx="14" fill="#FFFFFF" opacity="0.9"/>
+
+  <!-- Corpo da impressora térmica -->
+  <rect x="120" y="166" width="272" height="150" rx="30" fill="#FFFFFF"/>
+
+  <!-- Luzes indicadoras: laranja + verde (o mesmo verde da marca) -->
+  <circle cx="162" cy="204" r="11" fill="#FF6B35"/>
+  <circle cx="198" cy="204" r="11" fill="#25D366"/>
+
+  <!-- Fenda de saída do papel -->
+  <rect x="150" y="290" width="212" height="16" rx="8" fill="url(#kf-ink)"/>
+
+  <!-- Recibo/comanda saindo pela frente, com a borda serrilhada do corte -->
+  <path d="M174 298 H342 V404 l-14 12 -14 -12 -14 12 -14 -12 -14 12 -14 -12 -14 12 -14 -12 -14 12 -14 -12 -14 12 -14 -12 Z" fill="#FFFFFF"/>
+
+  <!-- Linhas de texto impressas no recibo -->
+  <g fill="url(#kf-ink)">
+    <rect x="196" y="322" width="128" height="12" rx="6"/>
+    <rect x="196" y="348" width="96" height="12" rx="6"/>
+    <rect x="196" y="374" width="112" height="12" rx="6"/>
+  </g>
+</svg>

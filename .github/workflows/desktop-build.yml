@@ -1,0 +1,164 @@
+name: Build App Desktop (Windows)
+
+# Gera o instalador Windows do KyberFood Desktop e publica numa Release do GitHub
+# com nome de arquivo FIXO, para o link de download servir sempre a versão mais nova.
+#
+# Este repositório é PÚBLICO só para ter Actions grátis em runner Windows; ele
+# contém apenas o cliente desktop (usa a chave anon do Supabase + a API pública).
+# O núcleo do SaaS continua em repositório privado.
+#
+# Dispara a cada push na main, gerando SEMPRE uma versão nova e maior: pega a
+# última versão publicada (latest.json da release) e soma +1 no patch
+# (1.0.18 -> 1.0.19 -> ...). Também pode ser rodado manualmente
+# (Actions > Build App Desktop > Run workflow) informando a versão, ou publicando
+# uma tag "desktop-v*" (ex.: git tag desktop-v1.0.20).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versão do app (ex.: 1.0.18). Deixe em branco para gerar automaticamente.'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+    tags:
+      - 'desktop-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Resolver versão do build
+        id: version
+        shell: bash
+        run: |
+          set -e
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            # Disparo manual com versão explícita: respeita o que o usuário informou.
+            V="${{ github.event.inputs.version }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            # Tag desktop-v*: usa a versão da própria tag.
+            V="${GITHUB_REF_NAME#desktop-v}"
+          else
+            # Push na main: SOBE SOZINHO para a próxima versão. Lê a última versão
+            # publicada (latest.json da release) e soma +1 no patch, garantindo que
+            # cada build gere uma versão nova e sempre maior (1.0.18 -> 1.0.19 -> ...).
+            BASE=$(node -p "require('./package.json').version.split('.').slice(0,2).join('.')")
+            curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/latest.json" -o latest_check.json || true
+            LATEST=$(node -e "try{process.stdout.write(String(JSON.parse(require('fs').readFileSync('latest_check.json','utf8')).version||''))}catch(e){}")
+            rm -f latest_check.json
+            if echo "$LATEST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              LMAJMIN="${LATEST%.*}"
+              LPATCH="${LATEST##*.}"
+              if [ "$LMAJMIN" = "$BASE" ]; then
+                # Mesma série major.minor: incrementa o patch da última publicada.
+                V="${BASE}.$((LPATCH + 1))"
+              else
+                # major.minor mudou no package.json (ex.: virou 1.1): começa no .0.
+                V="${BASE}.0"
+              fi
+            else
+              # Fallback seguro (não conseguiu ler a última versão): número do run.
+              V="${BASE}.${{ github.run_number }}"
+            fi
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Versão resolvida: $V"
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar toolchain Rust (estável)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache do Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Instalar dependências do frontend
+        run: npm install
+
+      - name: Aplicar a versão nos manifestos
+        # Injeta a versão resolvida em package.json e tauri.conf.json para que o
+        # instalador e o latest.json fiquem consistentes.
+        shell: bash
+        run: |
+          set -e
+          V="${{ steps.version.outputs.version }}"
+          node -e "const fs=require('fs');const p='package.json';const j=JSON.parse(fs.readFileSync(p));j.version='$V';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p));j.package.version='$V';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+
+      - name: Gerar arquivo .env de produção
+        # Opcional: se os Secrets estiverem configurados, sobrescrevem os valores
+        # de produção embutidos no app (FALLBACK_* no App.tsx). Sem Secrets, ficam
+        # vazios e o app usa os fallbacks — o build funciona do mesmo jeito.
+        shell: bash
+        run: |
+          cat > .env <<EOF
+          VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_API_URL=${{ secrets.VITE_API_URL }}
+          EOF
+
+      - name: Build do instalador Tauri (Windows)
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: .
+
+      - name: Renomear instaladores para nome fixo
+        # O Tauri gera nomes com a versão embutida (KyberFood_1.0.0_x64-setup.exe).
+        # Renomeamos para nomes SEM versão para o link de download ser sempre o mesmo.
+        shell: bash
+        run: |
+          set -e
+          nsis=$(ls src-tauri/target/release/bundle/nsis/*.exe | head -n1)
+          msi=$(ls src-tauri/target/release/bundle/msi/*.msi | head -n1)
+          cp "$nsis" "KyberFood-Setup.exe"
+          cp "$msi" "KyberFood-Setup.msi"
+          echo "Instaladores prontos: KyberFood-Setup.exe / KyberFood-Setup.msi"
+
+      - name: Gerar manifesto latest.json
+        # O app desktop consulta este arquivo para saber se há uma versão mais
+        # nova e oferecer (sem obrigar) a atualização ao usuário.
+        shell: bash
+        run: |
+          set -e
+          V="${{ steps.version.outputs.version }}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          cat > latest.json <<EOF
+          {
+            "version": "$V",
+            "pub_date": "$PUB_DATE",
+            "notes": "Nova versão do KyberFood Desktop disponível.",
+            "url_win": "https://github.com/${{ github.repository }}/releases/latest/download/KyberFood-Setup.exe"
+          }
+          EOF
+          cat latest.json
+
+      - name: Publicar Release "desktop-latest" (link de download estável)
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag fixa: a Release é sobrescrita a cada build, e o link
+          # .../releases/latest/download/KyberFood-Setup.exe aponta sempre para a versão nova.
+          tag_name: desktop-latest
+          name: KyberFood Desktop (última versão)
+          body: |
+            Instalador mais recente do KyberFood Desktop (Windows).
+            Versão: ${{ steps.version.outputs.version }}
+            Baixe o KyberFood-Setup.exe abaixo.
+          make_latest: true
+          files: |
+            KyberFood-Setup.exe
+            KyberFood-Setup.msi
+            latest.json

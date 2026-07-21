@@ -1,0 +1,24 @@
+[package]
+name = "kyberfood"
+version = "1.0.0"
+description = "KyberFood Desktop - Sistema de Notificações e Impressão"
+authors = ["KyberFood"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.70"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = [ "system-tray", "dialog-all", "http-all", "notification-all", "shell-open", "window-all"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+printpdf = "0.5"
+tauri-plugin-autostart = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
+lopdf = "0.31"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
