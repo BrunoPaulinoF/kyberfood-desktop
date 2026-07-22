@@ -25,3 +25,6 @@ npm-debug.log*
 
 # Misc
 *.pem
+
+# Env local (nunca commitar)
+.env
