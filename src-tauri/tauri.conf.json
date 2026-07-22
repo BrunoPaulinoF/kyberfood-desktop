@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "KyberFood",
-    "version": "1.0.18"
+    "version": "1.0.0"
   },
   "tauri": {
     "allowlist": {
@@ -33,10 +33,7 @@
       "http": {
         "all": true,
         "request": true,
-        "scope": [
-          "http://**",
-          "https://**"
-        ]
+        "scope": ["http://**", "https://**"]
       }
     },
     "bundle": {

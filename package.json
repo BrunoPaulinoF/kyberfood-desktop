@@ -1,6 +1,6 @@
 {
   "name": "kyberfood-desktop",
-  "version": "1.0.18",
+  "version": "1.0.0",
   "description": "KyberFood Desktop App - Notificações e Impressão de Pedidos",
   "scripts": {
     "dev": "vite",
