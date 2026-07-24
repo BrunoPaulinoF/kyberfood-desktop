@@ -33,6 +33,14 @@ interface UpdateInfo {
   notes?: string;
 }
 
+// Resultado da última verificação de atualização. 'idle' é o repouso: nada a dizer.
+type UpdateCheck =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'up-to-date'; latest: string }
+  | { state: 'outdated'; latest: string }
+  | { state: 'error' };
+
 // Compara duas versões no formato "1.2.3". Retorna >0 se a > b, <0 se a < b, 0 se iguais.
 function compareVersions(a: string, b: string): number {
   const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
@@ -468,45 +476,65 @@ function App() {
   const [lastOrderInfo, setLastOrderInfo] = useState<{ number: string; at: number; printed: boolean } | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheck>({ state: 'idle' });
 
-  // Verifica se há uma versão mais nova do app publicada. A atualização é
-  // opcional: só exibimos um botão; o usuário atualiza quando quiser.
-  useEffect(() => {
-    let cancelled = false;
+  /**
+   * Verifica se há versão mais nova publicada.
+   *
+   * Roda sozinha ao abrir e a cada 6h, mas TAMBÉM é acionável pelo lojista (`manual`):
+   * antes só existia a checagem silenciosa, então quem não via o botão aparecer não tinha
+   * como saber se estava atualizado ou se a checagem tinha simplesmente falhado. No modo
+   * manual o resultado é sempre dito em voz alta — inclusive "já está atualizado".
+   */
+  const checkForUpdate = useCallback(async (manual = false) => {
+    if (manual) setUpdateCheck({ state: 'checking' });
 
-    const checkForUpdate = async () => {
-      try {
-        const currentVersion = await getVersion();
-        // Reaproveitado no heartbeat: saber qual versão está em cada loja ajuda a
-        // diagnosticar uma presença que não aparece.
-        if (!cancelled) setAppVersion(currentVersion);
-        const res = await fetch(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`, { cache: 'no-store' });
-        if (!res.ok) return;
-        const manifest = await res.json();
-        const latest = String(manifest?.version ?? '').trim();
-        if (!latest) return;
+    try {
+      const currentVersion = await getVersion();
+      // Reaproveitado no heartbeat: saber qual versão está em cada loja ajuda a
+      // diagnosticar uma presença que não aparece, e alimenta a comparação de versões
+      // na página de Integrações do painel.
+      setAppVersion(currentVersion);
 
-        if (!cancelled && compareVersions(latest, currentVersion) > 0) {
-          setUpdateInfo({
-            version: latest,
-            url: String(manifest?.url_win || FALLBACK_DOWNLOAD_URL),
-            notes: manifest?.notes ? String(manifest.notes) : undefined,
-          });
-        }
-      } catch (err) {
-        // Sem internet ou release ainda não publicada: ignora silenciosamente.
-        console.warn('Falha ao verificar atualização:', err);
+      const res = await fetch(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const manifest = await res.json();
+      const latest = String(manifest?.version ?? '').trim();
+      if (!latest) throw new Error('manifesto sem versão');
+
+      if (compareVersions(latest, currentVersion) > 0) {
+        setUpdateInfo({
+          version: latest,
+          url: String(manifest?.url_win || FALLBACK_DOWNLOAD_URL),
+          notes: manifest?.notes ? String(manifest.notes) : undefined,
+        });
+        // Uma versão nova reabre o aviso mesmo que a anterior tenha sido dispensada.
+        setUpdateDismissed(false);
+        setUpdateCheck({ state: 'outdated', latest });
+      } else {
+        setUpdateInfo(null);
+        setUpdateCheck({ state: 'up-to-date', latest });
       }
-    };
+    } catch (err) {
+      console.warn('Falha ao verificar atualização:', err);
+      setUpdateCheck({ state: 'error' });
+    }
+  }, []);
 
+  useEffect(() => {
     checkForUpdate();
     // Reverifica a cada 6 horas enquanto o app estiver aberto.
-    const interval = setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, []);
+    const interval = setInterval(() => checkForUpdate(), 6 * 60 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [checkForUpdate]);
+
+  // A confirmação "já está atualizado" é passageira: some sozinha para não virar ruído
+  // permanente no cabeçalho.
+  useEffect(() => {
+    if (updateCheck.state !== 'up-to-date' && updateCheck.state !== 'error') return;
+    const timer = setTimeout(() => setUpdateCheck({ state: 'idle' }), 6000);
+    return () => clearTimeout(timer);
+  }, [updateCheck]);
 
   const handleUpdateClick = async () => {
     if (!updateInfo) return;
@@ -1117,6 +1145,36 @@ function App() {
             <h1 className="text-xl font-bold text-orange-500">KyberFood</h1>
             <span className="text-gray-400">|</span>
             <span className="text-gray-300">{store?.name}</span>
+
+            {/* Versão SEMPRE visível e clicável. Antes o app não dizia em que versão
+                estava, então não havia como conferir se um ajuste recente já tinha
+                chegado — e a checagem só acontecia em silêncio, sem confirmar nada. */}
+            <button
+              type="button"
+              onClick={() => checkForUpdate(true)}
+              disabled={updateCheck.state === 'checking'}
+              title="Clique para verificar se há atualização do app"
+              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition disabled:cursor-wait ${
+                updateCheck.state === 'up-to-date'
+                  ? 'border-green-600 bg-green-600/20 text-green-300'
+                  : updateCheck.state === 'error'
+                    ? 'border-yellow-600 bg-yellow-600/20 text-yellow-300'
+                    : updateInfo && !updateDismissed
+                      ? 'border-orange-600 bg-orange-600/20 text-orange-300'
+                      : 'border-gray-600 bg-gray-700/50 text-gray-300 hover:border-gray-500 hover:text-white'
+              }`}
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${updateCheck.state === 'checking' ? 'animate-spin' : ''}`} />
+              {updateCheck.state === 'checking'
+                ? 'Verificando…'
+                : updateCheck.state === 'up-to-date'
+                  ? `v${appVersion} · atualizado`
+                  : updateCheck.state === 'error'
+                    ? 'Não consegui verificar'
+                    : updateInfo
+                      ? `v${appVersion} · atualização disponível`
+                      : `v${appVersion || '—'}`}
+            </button>
           </div>
           
           <div className="flex items-center gap-4">
