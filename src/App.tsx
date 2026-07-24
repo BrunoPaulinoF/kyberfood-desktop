@@ -21,11 +21,82 @@ import {
 import { invoke } from '@tauri-apps/api/tauri';
 import { getVersion } from '@tauri-apps/api/app';
 import { open as openExternal } from '@tauri-apps/api/shell';
+import { fetch as tauriFetch, Body, ResponseType } from '@tauri-apps/api/http';
+
+const isTauri = typeof window !== 'undefined' && '__TAURI_IPC__' in window;
+
+/**
+ * Requisição HTTP que sai pelo RUST quando rodando dentro do app.
+ *
+ * O `window.fetch` do webview parte de uma origem própria (tauri://localhost) e sofre
+ * CORS: o manifesto de atualização mora numa release do GitHub, que redireciona para
+ * objects.githubusercontent.com — domínio que não libera outra origem. Resultado: a
+ * verificação de atualização falhava SEMPRE, em silêncio, e o botão de atualizar nunca
+ * aparecia. Pelo cliente do Tauri a requisição é feita pelo processo nativo, onde CORS
+ * simplesmente não existe.
+ *
+ * Fora do app (ex.: `npm run dev` aberto no navegador) cai no fetch normal. Se o caminho
+ * nativo falhar por qualquer motivo, ainda tentamos o fetch do webview: para a nossa
+ * própria API ele comprovadamente funciona, e o heartbeat é idempotente (upsert), então
+ * repetir a chamada é inofensivo — bem melhor que ficar sem batida.
+ */
+async function httpJson<T = any>(
+  url: string,
+  options: { method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: unknown; timeoutSeconds?: number } = {},
+): Promise<{ ok: boolean; status: number; data: T | null }> {
+  const method = options.method || 'GET';
+
+  if (isTauri) {
+    try {
+      const res = await tauriFetch<T>(url, {
+        method,
+        headers: options.headers,
+        responseType: ResponseType.JSON,
+        timeout: options.timeoutSeconds ?? 20,
+        ...(options.body !== undefined ? { body: Body.json(options.body as any) } : {}),
+      });
+      return { ok: res.ok, status: res.status, data: (res.data ?? null) as T | null };
+    } catch (err) {
+      console.warn('Requisição nativa falhou, tentando pelo webview:', err);
+    }
+  }
+
+  const res = await fetch(url, {
+    method,
+    headers: options.headers,
+    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+  });
+  const data = await res.json().catch(() => null);
+  return { ok: res.ok, status: res.status, data: data as T | null };
+}
 
 // Manifesto publicado pelo GitHub Actions a cada build do app desktop.
 // O app o consulta para saber se há uma versão mais nova (atualização opcional).
 const UPDATE_MANIFEST_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/latest.json';
 const FALLBACK_DOWNLOAD_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/KyberFood-Setup.exe';
+
+type UpdateManifest = { version?: string; url_win?: string | null; notes?: string | null };
+
+/**
+ * Descobre a versão publicada, em duas fontes.
+ *
+ * Primeiro pelo nosso servidor (que já é consultado pelo app e devolve o manifesto em
+ * cache) e, se ele não responder, direto no GitHub. Duas fontes porque a resposta precisa
+ * ser confiável: uma falha aqui reaparece para o lojista como "não consigo saber se estou
+ * atualizado", que foi exatamente o problema relatado.
+ */
+async function fetchLatestManifest(): Promise<UpdateManifest | null> {
+  try {
+    const res = await httpJson<UpdateManifest>(`${apiUrl}/api/desktop/latest-version`);
+    if (res.ok && res.data?.version) return res.data;
+  } catch (err) {
+    console.warn('Versão publicada indisponível pelo servidor do KyberFood:', err);
+  }
+
+  const res = await httpJson<UpdateManifest>(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.data;
+}
 
 interface UpdateInfo {
   version: string;
@@ -496,9 +567,7 @@ function App() {
       // na página de Integrações do painel.
       setAppVersion(currentVersion);
 
-      const res = await fetch(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const manifest = await res.json();
+      const manifest = await fetchLatestManifest();
       const latest = String(manifest?.version ?? '').trim();
       if (!latest) throw new Error('manifesto sem versão');
 
@@ -569,17 +638,21 @@ function App() {
     const sendHeartbeat = async (attempt = 0) => {
       if (cancelled) return;
       try {
-        const res = await fetch(
+        // Pelo cliente nativo (httpJson): é ESTE heartbeat que mantém a IA atendendo, e
+        // um bloqueio de CORS aqui deixaria a loja "offline" para o servidor sem nenhum
+        // sintoma visível — o mesmo tipo de falha silenciosa que quebrava a verificação
+        // de atualização.
+        const res = await httpJson<{ print_config?: unknown; ai_gate?: { ai_serving?: boolean } }>(
           `${apiUrl}/api/desktop/heartbeat?storeId=${store.id}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...(await getAuthHeaders()) },
-            body: JSON.stringify({ device_id: getDeviceId(), app_version: appVersion || null }),
+            body: { device_id: getDeviceId(), app_version: appVersion || null },
           }
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-        const data = await res.json();
+        const data = res.data;
         if (cancelled) return;
         if (data?.print_config) setPrintConfig(normalizePrintConfig(data.print_config));
         setAiServing(data?.ai_gate?.ai_serving !== false);
