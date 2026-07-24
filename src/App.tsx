@@ -293,7 +293,7 @@ const FALLBACK_SUPABASE_URL = 'https://ieghgwrmzoewezzyxvfn.supabase.co';
 const FALLBACK_SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImllZ2hnd3Jtem9ld2V6enl4dmZuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyNzg0MTYsImV4cCI6MjA4OTg1NDQxNn0.iRnTWaiRohfC_i98mldxuhNKk1Gx23dySrkKhefArec';
 // URL do painel web em produção (mesma origem da API que o desktop consome).
-const FALLBACK_API_URL = 'https://kyberfood.kybernan.com.br';
+const FALLBACK_API_URL = 'https://kyberfood.com.br';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || FALLBACK_SUPABASE_URL;
 const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || FALLBACK_SUPABASE_ANON_KEY;
@@ -335,6 +335,25 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
   },
   global: { fetch: fetchWithTimeout },
 });
+
+// Identidade estável desta instalação. Uma loja pode ter mais de um PC com o app aberto;
+// o servidor guarda uma linha de presença por dispositivo e considera a loja online se
+// QUALQUER um estiver batendo. Sem um id por máquina, um PC sobrescreveria o outro.
+const DEVICE_ID_STORAGE_KEY = 'kyberfood.desktop.deviceId';
+
+function getDeviceId(): string {
+  try {
+    const saved = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+    if (saved) return saved;
+    const generated = globalThis.crypto?.randomUUID?.() || `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(DEVICE_ID_STORAGE_KEY, generated);
+    return generated;
+  } catch {
+    // Sem localStorage o app continua contando como presença, só perde a distinção
+    // entre dispositivos da mesma loja.
+    return 'default';
+  }
+}
 
 // A API web exige autenticação (cookie ou Bearer); o desktop envia o token da sessão Supabase.
 async function getAuthHeaders(): Promise<Record<string, string>> {
@@ -403,6 +422,12 @@ function App() {
   const [inProgressOrders, setInProgressOrders] = useState<Order[]>([]);
   const [settings, setSettings] = useState<Settings>(loadStoredSettings);
   const [printConfig, setPrintConfig] = useState<PrintConfig>(DEFAULT_PRINT_CONFIG);
+  // Estado da trava de presença, respondido pelo heartbeat. `aiServing` começa true para
+  // a tela não acusar problema antes da primeira batida; `heartbeatFailing` só liga depois
+  // das retentativas, e é o que avisa o lojista de que a IA está prestes a parar.
+  const [aiServing, setAiServing] = useState(true);
+  const [heartbeatFailing, setHeartbeatFailing] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>('');
   // Refs para o handler de realtime sempre imprimir com os valores mais recentes
   // (o efeito de subscribe não re-roda a cada atualização de config/settings).
   const settingsRef = useRef(settings);
@@ -452,6 +477,9 @@ function App() {
     const checkForUpdate = async () => {
       try {
         const currentVersion = await getVersion();
+        // Reaproveitado no heartbeat: saber qual versão está em cada loja ajuda a
+        // diagnosticar uma presença que não aparece.
+        if (!cancelled) setAppVersion(currentVersion);
         const res = await fetch(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`, { cache: 'no-store' });
         if (!res.ok) return;
         const manifest = await res.json();
@@ -498,36 +526,69 @@ function App() {
     }
   }, [settings]);
 
-  // Heartbeat: avisa o servidor que o app está online (para o painel mostrar
-  // "conectado") e busca a configuração de impressão atual definida pelo lojista.
+  // Heartbeat: avisa o servidor que o app está online e busca a configuração de impressão
+  // atual definida pelo lojista.
+  //
+  // Este heartbeat NÃO é mais só cosmético: é ele que mantém a IA atendendo no WhatsApp
+  // (o servidor considera a loja offline após ~5 batidas perdidas). Por isso ele tem
+  // retentativa curta em caso de falha e volta a bater assim que a máquina acorda ou a
+  // rede retorna — e por isso o resultado vira um selo visível na tela.
   useEffect(() => {
     if (!isAuthenticated || !store) return;
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const sendHeartbeat = async () => {
+    const sendHeartbeat = async (attempt = 0) => {
+      if (cancelled) return;
       try {
         const res = await fetch(
           `${apiUrl}/api/desktop/heartbeat?storeId=${store.id}`,
-          { method: 'POST', headers: await getAuthHeaders() }
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(await getAuthHeaders()) },
+            body: JSON.stringify({ device_id: getDeviceId(), app_version: appVersion || null }),
+          }
         );
-        if (!res.ok) return;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
         const data = await res.json();
-        if (!cancelled && data?.print_config) {
-          setPrintConfig(normalizePrintConfig(data.print_config));
-        }
+        if (cancelled) return;
+        if (data?.print_config) setPrintConfig(normalizePrintConfig(data.print_config));
+        setAiServing(data?.ai_gate?.ai_serving !== false);
+        setHeartbeatFailing(false);
       } catch (err) {
         console.warn('Falha no heartbeat do desktop:', err);
+        if (cancelled) return;
+        // Backoff curto (10s, 20s): três chances dentro do minuto da próxima batida, para
+        // que um soluço de rede não derrube a IA por engano.
+        if (attempt < 2) {
+          retryTimer = setTimeout(() => sendHeartbeat(attempt + 1), (attempt + 1) * 10_000);
+        } else {
+          setHeartbeatFailing(true);
+        }
       }
     };
 
-    sendHeartbeat();
+    const beatNow = () => sendHeartbeat();
+
+    beatNow();
     // A cada 60s: mantém o status "conectado" e sincroniza a config de impressão.
-    const interval = setInterval(sendHeartbeat, 60 * 1000);
+    const interval = setInterval(beatNow, 60 * 1000);
+    // Voltar de suspensão do PC ou de queda de rede: bate na hora em vez de esperar o
+    // próximo tick — é justamente o momento em que a IA está parada esperando o app.
+    window.addEventListener('online', beatNow);
+    window.addEventListener('focus', beatNow);
+    document.addEventListener('visibilitychange', beatNow);
+
     return () => {
       cancelled = true;
       clearInterval(interval);
+      if (retryTimer) clearTimeout(retryTimer);
+      window.removeEventListener('online', beatNow);
+      window.removeEventListener('focus', beatNow);
+      document.removeEventListener('visibilitychange', beatNow);
     };
-  }, [isAuthenticated, store]);
+  }, [isAuthenticated, store, appVersion]);
 
   // Alerta (som + notificação) e IMPRESSÃO da comanda de um pedido. Idempotente:
   // chamado por realtime e polling, com dedup próprio para cada ação, então pode
@@ -1059,6 +1120,33 @@ function App() {
           </div>
           
           <div className="flex items-center gap-4">
+            {/* Selo da trava de presença. Fica SEMPRE visível: o app aberto é o que
+                mantém a IA atendendo no WhatsApp, então o lojista precisa enxergar essa
+                relação na tela onde ele opera — e não descobrir pelo silêncio. */}
+            <div
+              className={`flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium border ${
+                heartbeatFailing
+                  ? 'bg-yellow-600/20 border-yellow-600 text-yellow-300'
+                  : aiServing
+                    ? 'bg-green-600/20 border-green-600 text-green-300'
+                    : 'bg-red-600/20 border-red-600 text-red-300'
+              }`}
+              title={
+                heartbeatFailing
+                  ? 'Sem conexão com o servidor. Se não voltar em alguns minutos, a IA para de atender.'
+                  : aiServing
+                    ? 'A IA está atendendo os clientes no WhatsApp enquanto este app estiver aberto.'
+                    : 'A IA NÃO está atendendo: mantenha este app aberto e conectado.'
+              }
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  heartbeatFailing ? 'bg-yellow-400' : aiServing ? 'bg-green-400' : 'bg-red-400'
+                }`}
+              />
+              {heartbeatFailing ? 'Sem conexão' : aiServing ? 'IA atendendo' : 'IA parada'}
+            </div>
+
             {/* Update available (optional) */}
             {updateInfo && !updateDismissed && (
               <div className="flex items-center gap-1 bg-orange-600/20 border border-orange-600 rounded-full pl-3 pr-1 py-1">

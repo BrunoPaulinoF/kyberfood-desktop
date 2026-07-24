@@ -13,7 +13,7 @@ GitHub → Settings → Secrets and variables → Actions → New repository sec
 
 - `VITE_SUPABASE_URL` — URL do projeto Supabase
 - `VITE_SUPABASE_ANON_KEY` — chave anon do Supabase
-- `VITE_API_URL` — URL do app web em produção (ex.: `https://kyberfood.kybernan.com.br`)
+- `VITE_API_URL` — URL do app web em produção (ex.: `https://kyberfood.com.br`)
 
 **2. Rode o workflow:**
 GitHub → aba **Actions** → **Build App Desktop (Windows)** → **Run workflow**.
