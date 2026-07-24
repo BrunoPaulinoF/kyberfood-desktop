@@ -1053,11 +1053,18 @@ function App() {
 
   // Busca a loja "principal" do usuário — usuários com 2+ lojas quebravam o
   // .single(); pega a loja mais antiga sem errar quando há várias.
+  //
+  // Filtra is_active=true DE PROPÓSITO: o backend (validateAuth/validateBearerAuth)
+  // resolve a loja com esse mesmo filtro. Sem ele aqui, um usuário cuja loja mais
+  // antiga esteja INATIVA mandaria o heartbeat com o storeId da inativa, enquanto o
+  // painel lê a presença da ativa — a loja apareceria "desconectada" mesmo com o app
+  // batendo. Manter os dois lados idênticos garante que a presença cai na loja certa.
   const loadStoreForUser = useCallback(async (userId: string): Promise<Store | null> => {
     const { data: storeData } = await supabase
       .from('stores')
       .select('*')
       .eq('user_id', userId)
+      .eq('is_active', true)
       .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
