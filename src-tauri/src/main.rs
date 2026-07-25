@@ -92,7 +92,13 @@ fn to_ascii_bytes(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     for ch in text.chars() {
         if ch.is_ascii() {
-            out.push(ch as u8);
+            // Só ASCII IMPRIMÍVEL (0x20–0x7E). Bytes de controle vindos de um campo do
+            // pedido (nome, endereço, observação) seriam COMANDOS para a impressora:
+            // "ESC = 0" a deseleciona (o spooler aceita os jobs e nada mais imprime),
+            // "GS V" corta a comanda no meio e "ESC p" abre a gaveta de dinheiro.
+            // A quebra de linha legítima é emitida por build_escpos, nunca pelo conteúdo.
+            let byte = ch as u8;
+            out.push(if (0x20..=0x7E).contains(&byte) { byte } else { b' ' });
             continue;
         }
         let mapped: &[u8] = match ch {

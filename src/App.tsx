@@ -2108,6 +2108,21 @@ function flavorFractionPrefix(comp: { groupName?: string | null }, flavorCount: 
   return flavorCount >= 2 && isFlavorComplement(comp) ? `1/${flavorCount} ` : '';
 }
 
+// Troca caracteres de controle por espaço. ESPELHA stripControlChars de
+// src/lib/sanitize-text.ts no app web (projetos separados, não há import entre eles).
+// Comparação numérica de propósito: escrever esses caracteres numa classe de regex
+// deixaria bytes de controle literais no código-fonte.
+function stripControlChars(value: unknown): string {
+  const text = String(value ?? '');
+  let out = '';
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    const isControl = code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
+    out += isControl ? ' ' : ch;
+  }
+  return out;
+}
+
 // Monta as linhas da comanda respeitando a configuração de impressão do lojista.
 // ESPELHA src/lib/desktop-print-config.ts (buildReceiptLines) do app web, para
 // que a pré-visualização mostrada no painel seja fiel à impressão real.
@@ -2186,7 +2201,12 @@ function buildReceiptLines(order: Order, store: Store, config: PrintConfig): str
     lines.push(center(config.footerText));
   }
 
-  return lines;
+  // TRAVA ANTI-FORJA: nenhum campo do pedido pode criar uma LINHA NOVA na comanda.
+  // Um cliente que põe quebras de linha no próprio nome do WhatsApp forjava um
+  // "STATUS: PAGO" logo abaixo do "CLIENTE:" e a comanda saía idêntica à de um
+  // pedido pago. A troca é por espaço justamente para o alinhamento em colunas
+  // montado acima continuar válido.
+  return lines.map(stripControlChars);
 }
 
 // Escapa strings vindas do pedido (nome do cliente, observações etc.) antes de
