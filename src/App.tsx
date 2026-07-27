@@ -384,6 +384,61 @@ const apiUrl = import.meta.env.VITE_API_URL || FALLBACK_API_URL;
 // reautentica sozinho ao abrir, sem pedir senha de novo.
 const AUTH_STORAGE_KEY = 'kyberfood.desktop.auth';
 
+/**
+ * Credenciais salvas para o RELOGIN AUTOMÁTICO.
+ *
+ * Regra do produto: uma vez que a conta foi conectada neste PC, ela NUNCA se desconecta
+ * sozinha. Sessão perdida (refresh token expirado depois de dias sem internet, relógio do
+ * PC errado, sessão revogada do outro lado) não pode virar "tela de login esperando alguém
+ * digitar" — isso é a loja muda, sem IA e sem comanda, até alguém reparar. Só o botão Sair
+ * desconecta de verdade, e é ele que apaga o que está aqui.
+ *
+ * Sobre guardar a senha: fica no mesmo localStorage onde o Supabase JÁ guarda o refresh
+ * token — que, sozinho, também dá acesso total à conta. Ou seja, a proteção real (aqui e
+ * lá) é a pasta de perfil do usuário do Windows. O base64 não é criptografia, é só para o
+ * arquivo não expor a senha a olho nu.
+ */
+const CREDENTIALS_STORAGE_KEY = 'kyberfood.desktop.credentials';
+
+/**
+ * Cadência do heartbeat. O servidor dá a loja como offline após 5 min sem batida
+ * (DESKTOP_PRESENCE_GRACE_MS, em src/lib/store-availability.ts do app web), então 30s
+ * significa 10 batidas de folga antes de a IA parar de atender.
+ */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+type SavedCredentials = { email: string; password: string };
+
+function saveCredentials(credentials: SavedCredentials) {
+  try {
+    const json = JSON.stringify(credentials);
+    localStorage.setItem(CREDENTIALS_STORAGE_KEY, btoa(String.fromCharCode(...new TextEncoder().encode(json))));
+  } catch {
+    /* sem storage o relogin automático não existe, mas o login normal continua */
+  }
+}
+
+function loadCredentials(): SavedCredentials | null {
+  try {
+    const raw = localStorage.getItem(CREDENTIALS_STORAGE_KEY);
+    if (!raw) return null;
+    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (typeof parsed?.email === 'string' && typeof parsed?.password === 'string') return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function clearCredentials() {
+  try {
+    localStorage.removeItem(CREDENTIALS_STORAGE_KEY);
+  } catch {
+    /* ignora */
+  }
+}
+
 // Timeout em TODA chamada HTTP do Supabase (auth + REST). Sem isto, uma chamada
 // pendurada (rede instável, endpoint lento, refresh de token) fica esperando
 // PARA SEMPRE — foi o que deixava o app preso em "Conectando…" ao reabrir.
@@ -506,6 +561,14 @@ function App() {
   // das retentativas, e é o que avisa o lojista de que a IA está prestes a parar.
   const [aiServing, setAiServing] = useState(true);
   const [heartbeatFailing, setHeartbeatFailing] = useState(false);
+  // Relogin automático em andamento: mostra "Reconectando…" em vez da tela de login, para
+  // ninguém achar que precisa digitar a senha (e para o app não parecer deslogado).
+  const [reconnecting, setReconnecting] = useState(false);
+  // true SÓ durante o logout explícito (botão Sair). É o que separa "o lojista quis sair"
+  // de "a sessão caiu" — no segundo caso o app tem que voltar sozinho.
+  const loggingOutRef = useRef(false);
+  const reloginBusyRef = useRef(false);
+  const reloginTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [appVersion, setAppVersion] = useState<string>('');
   // Refs para o handler de realtime sempre imprimir com os valores mais recentes
   // (o efeito de subscribe não re-roda a cada atualização de config/settings).
@@ -623,13 +686,26 @@ function App() {
     }
   }, [settings]);
 
+  // Sinal de vida para o watchdog NATIVO (RendererWatchdog, em src-tauri/src/main.rs).
+  //
+  // Fora de qualquer condição de login de propósito: se o WebView2 congelar — o que já
+  // derrubou a IA com o app aberto na bandeja —, quem percebe e ressuscita é o Rust, e ele
+  // só consegue perceber pela ausência deste ping.
+  useEffect(() => {
+    if (!isTauri) return;
+    const ping = () => { invoke('renderer_alive').catch(() => {}); };
+    ping();
+    const id = setInterval(ping, 15_000);
+    return () => clearInterval(id);
+  }, []);
+
   // Heartbeat: avisa o servidor que o app está online e busca a configuração de impressão
   // atual definida pelo lojista.
   //
   // Este heartbeat NÃO é mais só cosmético: é ele que mantém a IA atendendo no WhatsApp
-  // (o servidor considera a loja offline após ~5 batidas perdidas). Por isso ele tem
-  // retentativa curta em caso de falha e volta a bater assim que a máquina acorda ou a
-  // rede retorna — e por isso o resultado vira um selo visível na tela.
+  // (o servidor considera a loja offline após 5 min sem batida). Por isso ele bate a cada
+  // 30s — 10 batidas de folga —, tem retentativa curta em caso de falha, volta a bater
+  // assim que a máquina acorda ou a rede retorna, e o resultado vira um selo na tela.
   useEffect(() => {
     if (!isAuthenticated || !store) return;
     let cancelled = false;
@@ -650,6 +726,13 @@ function App() {
             body: { device_id: getDeviceId(), app_version: appVersion || null },
           }
         );
+        // 401 = o token da sessão não vale mais. Não adianta repetir a batida com ele: a
+        // conta precisa voltar, e é o relogin automático que faz isso (com a credencial
+        // salva). Sem este ramo, a loja ficaria offline até alguém abrir o app e digitar.
+        if (res.status === 401) {
+          void reloginRef.current();
+          throw new Error('HTTP 401');
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
         const data = res.data;
@@ -660,10 +743,11 @@ function App() {
       } catch (err) {
         console.warn('Falha no heartbeat do desktop:', err);
         if (cancelled) return;
-        // Backoff curto (10s, 20s): três chances dentro do minuto da próxima batida, para
-        // que um soluço de rede não derrube a IA por engano.
+        // Backoff curto (5s, 10s, 20s) DENTRO do ciclo de 30s: um soluço de rede não pode
+        // derrubar a IA por engano. Esgotadas as tentativas, só acende o aviso na tela — o
+        // intervalo continua batendo, então o app se recupera sozinho quando a rede volta.
         if (attempt < 2) {
-          retryTimer = setTimeout(() => sendHeartbeat(attempt + 1), (attempt + 1) * 10_000);
+          retryTimer = setTimeout(() => sendHeartbeat(attempt + 1), 5_000 * 2 ** attempt);
         } else {
           setHeartbeatFailing(true);
         }
@@ -673,17 +757,28 @@ function App() {
     const beatNow = () => sendHeartbeat();
 
     beatNow();
-    // A cada 60s: mantém o status "conectado" e sincroniza a config de impressão.
-    const interval = setInterval(beatNow, 60 * 1000);
+    // A cada 30s: mantém o status "conectado" e sincroniza a config de impressão.
+    const interval = setInterval(beatNow, HEARTBEAT_INTERVAL_MS);
     // Voltar de suspensão do PC ou de queda de rede: bate na hora em vez de esperar o
     // próximo tick — é justamente o momento em que a IA está parada esperando o app.
     window.addEventListener('online', beatNow);
     window.addEventListener('focus', beatNow);
     document.addEventListener('visibilitychange', beatNow);
 
+    // Detector de congelamento/suspensão: se o relógio andou MUITO mais que o tique de 5s,
+    // este webview esteve parado (PC suspenso, timer estrangulado) e o servidor pode já ter
+    // dado a loja como offline. Bate imediatamente em vez de esperar o ciclo normal.
+    let lastTick = Date.now();
+    const driftWatch = setInterval(() => {
+      const now = Date.now();
+      if (now - lastTick > 20_000) beatNow();
+      lastTick = now;
+    }, 5_000);
+
     return () => {
       cancelled = true;
       clearInterval(interval);
+      clearInterval(driftWatch);
       if (retryTimer) clearTimeout(retryTimer);
       window.removeEventListener('online', beatNow);
       window.removeEventListener('focus', beatNow);
@@ -1071,6 +1166,76 @@ function App() {
     return (storeData as Store) ?? null;
   }, []);
 
+  /**
+   * Refaz o login sozinho com a credencial salva. A conta só sai de verdade pelo botão Sair.
+   *
+   * Retenta PARA SEMPRE (backoff até 60s) enquanto o erro puder ser temporário — rede caída,
+   * Supabase fora do ar, PC recém-ligado sem internet. A única saída é a credencial ser
+   * REJEITADA (senha trocada): aí a máquina não tem como resolver e o lojista precisa
+   * digitar de novo.
+   */
+  const attemptAutoRelogin = useCallback(async (attempt = 0) => {
+    if (loggingOutRef.current || reloginBusyRef.current) return;
+    const credentials = loadCredentials();
+    if (!credentials) return;
+
+    reloginBusyRef.current = true;
+    setReconnecting(true);
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword(credentials);
+      if (error) throw error;
+      if (!data.session) throw new Error('sessão vazia');
+      // Daqui o onAuthStateChange assume: recarrega a loja e religa o realtime.
+      setError(null);
+      setReconnecting(false);
+    } catch (err: any) {
+      const message = String(err?.message || '').toLowerCase();
+      const rejected =
+        message.includes('invalid login') ||
+        message.includes('invalid credentials') ||
+        message.includes('email not confirmed') ||
+        message.includes('user not found');
+
+      if (rejected) {
+        clearCredentials();
+        setReconnecting(false);
+        setError('A senha salva não vale mais. Entre novamente para o app voltar a receber pedidos.');
+        return;
+      }
+
+      console.warn('Relogin automático falhou, vou tentar de novo:', err);
+      const delay = Math.min(60_000, 5_000 * 2 ** attempt);
+      if (reloginTimerRef.current) clearTimeout(reloginTimerRef.current);
+      reloginTimerRef.current = setTimeout(() => { void attemptAutoRelogin(attempt + 1); }, delay);
+    } finally {
+      reloginBusyRef.current = false;
+    }
+  }, []);
+
+  // Ref estável para quem precisa disparar o relogin sem entrar na lista de dependências
+  // (o heartbeat, por exemplo, que não pode ser recriado a cada render).
+  const reloginRef = useRef(attemptAutoRelogin);
+  useEffect(() => { reloginRef.current = attemptAutoRelogin; }, [attemptAutoRelogin]);
+
+  // Sentinela da sessão: a cada minuto confere se a conta continua conectada. Existe porque
+  // nem toda perda de sessão emite SIGNED_OUT — um refresh que falha em silêncio deixa o app
+  // "logado" na tela e sem token válido, e a loja some do ar sem ninguém perceber.
+  useEffect(() => {
+    const check = async () => {
+      if (loggingOutRef.current || !loadCredentials()) return;
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) void attemptAutoRelogin();
+      } catch {
+        // Falha de rede: o próprio relogin (ou a próxima checagem) resolve.
+      }
+    };
+    const id = setInterval(check, 60_000);
+    return () => clearInterval(id);
+  }, [attemptAutoRelogin]);
+
+  useEffect(() => () => { if (reloginTimerRef.current) clearTimeout(reloginTimerRef.current); }, []);
+
   // Restauração de sessão no arranque + sincronização contínua.
   // Usamos onAuthStateChange como fonte da verdade: ele emite INITIAL_SESSION no
   // arranque lendo a sessão salva do storage (sem depender de rede), o que evita
@@ -1111,6 +1276,14 @@ function App() {
         setIsAuthenticated(false);
         setStore(null);
         setAuthLoading(false);
+        // ...a não ser que a conta já tenha sido conectada neste PC: aí isto NÃO é um
+        // logout, é uma falha, e o app se reconecta sozinho com a credencial salva.
+        if (!loggingOutRef.current && loadCredentials()) {
+          // Já marca aqui (e não só dentro do relogin) para a tela de login não PISCAR
+          // entre a perda da sessão e a primeira tentativa.
+          setReconnecting(true);
+          setTimeout(() => { if (active) void attemptAutoRelogin(); }, 0);
+        }
         return;
       }
       // CRÍTICO p/ o realtime: a RLS de `orders` exige auth.uid() = dono da loja.
@@ -1128,7 +1301,7 @@ function App() {
       clearTimeout(splashTimer);
       subscription.unsubscribe();
     };
-  }, [loadStoreForUser]);
+  }, [loadStoreForUser, attemptAutoRelogin]);
 
   // Login handler
   const handleLogin = async (email: string, password: string) => {
@@ -1143,8 +1316,13 @@ function App() {
       const storeData = await loadStoreForUser(data.user.id);
 
       if (storeData) {
+        // Credencial guardada no ato: a partir daqui este PC se reconecta sozinho a
+        // qualquer perda de sessão, sem depender de alguém estar na frente da tela.
+        saveCredentials({ email, password });
+        loggingOutRef.current = false;
         setStore(storeData);
         setIsAuthenticated(true);
+        setReconnecting(false);
         setError(null);
       } else {
         setError('Nenhuma loja encontrada para este usuário');
@@ -1154,10 +1332,18 @@ function App() {
     }
   };
 
-  // Logout EXPLÍCITO (botão dentro do app). O login é persistente por padrão:
-  // fechar pela bandeja e reabrir mantém a conta conectada (a sessão fica salva
-  // e o token renova sozinho). O usuário só sai da conta clicando aqui.
+  // Logout EXPLÍCITO (botão dentro do app) — a ÚNICA forma de a conta sair de verdade.
+  // Fora daqui o login é permanente: fechar pela bandeja, reiniciar o PC, ficar dias sem
+  // internet ou perder a sessão não desconectam nada — o app refaz o login sozinho com a
+  // credencial salva. Por isso este é também o único ponto que apaga essa credencial.
   const handleLogout = async () => {
+    loggingOutRef.current = true;
+    if (reloginTimerRef.current) {
+      clearTimeout(reloginTimerRef.current);
+      reloginTimerRef.current = null;
+    }
+    clearCredentials();
+    setReconnecting(false);
     try {
       await supabase.auth.signOut();
     } catch (err) {
@@ -1206,6 +1392,23 @@ function App() {
         <div className="flex flex-col items-center gap-4 text-gray-400">
           <RefreshCw className="w-8 h-8 text-orange-500 animate-spin" />
           <span className="text-sm">Conectando…</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Relogin automático em curso: a conta NÃO saiu, só caiu. Mostrar a tela de login aqui
+  // faria a equipe achar que precisa digitar a senha — e, pior, esconderia que o app está
+  // se recuperando sozinho.
+  if (!isAuthenticated && reconnecting) {
+    return (
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
+        <div className="flex flex-col items-center gap-4 text-center text-gray-400">
+          <RefreshCw className="w-8 h-8 text-orange-500 animate-spin" />
+          <span className="text-sm">Reconectando à sua conta…</span>
+          <span className="max-w-xs text-xs text-gray-500">
+            A conexão caiu e o app está entrando de novo sozinho. Não precisa fazer nada.
+          </span>
         </div>
       </div>
     );

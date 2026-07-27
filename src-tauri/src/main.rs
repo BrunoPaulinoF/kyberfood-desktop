@@ -428,7 +428,56 @@ Impressora funcionando!
 use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
+/// Última vez que a interface deu sinal de vida (comando `renderer_alive`, chamado a cada
+/// 15s pelo React).
+///
+/// POR QUE ISTO EXISTE: este app passa a vida ESCONDIDO na bandeja (fecha em `window.hide()`
+/// e inicia com `--minimized`). Toda a operação — heartbeat que mantém a IA atendendo,
+/// realtime dos pedidos, impressão da comanda — roda dentro do WebView2, e o Chromium
+/// congela/estrangula os timers de uma janela oculta. Quando isso acontece o app CONTINUA
+/// aberto e logado, mas para de bater o heartbeat: em 5 min o servidor dá a loja como
+/// offline e a IA deixa de atender. Foi exatamente o que aconteceu em 26/07/2026.
+///
+/// A defesa principal é desligar o throttling do WebView2 (ver `main`). Este watchdog é a
+/// segunda linha: roda numa THREAD NATIVA, imune a qualquer congelamento do webview, e
+/// ressuscita a interface se ela parar de dar sinal.
+struct RendererWatchdog {
+    last_ping: std::sync::Mutex<std::time::Instant>,
+}
+
+/// Sinal de vida da interface. Só carimba a hora — barato o bastante para rodar a cada 15s.
+#[tauri::command]
+fn renderer_alive(state: tauri::State<'_, RendererWatchdog>) {
+    if let Ok(mut last) = state.last_ping.lock() {
+        *last = std::time::Instant::now();
+    }
+}
+
+/// Silêncio da interface que dispara o primeiro socorro (recarregar a página).
+/// 120s = 8 pings perdidos, bem dentro dos 5 min de tolerância do servidor: dá tempo de
+/// recarregar e voltar a bater o heartbeat ANTES de a loja aparecer offline.
+const RENDERER_SILENCE_RELOAD_SECS: u64 = 120;
+/// Silêncio que dispara o último recurso: mostrar a janela. Trazer o webview para a tela
+/// força o Chromium a descongelá-lo, e de quebra a equipe VÊ que algo travou — melhor uma
+/// janela aparecendo do que a loja muda perdendo venda.
+const RENDERER_SILENCE_SHOW_SECS: u64 = 240;
+
 fn main() {
+    // Mata o congelamento de timers em janela oculta ANTES de o WebView2 subir (a variável
+    // é lida na criação do ambiente do webview, então precisa estar posta aqui).
+    //  - disable-background-timer-throttling ..: setInterval não cai para 1x/min em background
+    //  - disable-backgrounding-occluded-windows: janela coberta/minimizada não é "backgrounded"
+    //  - disable-renderer-backgrounding .......: o processo do renderer não perde prioridade
+    //  - IntensiveWakeUpThrottling ............: desliga o estrangulamento agressivo pós-5min
+    //  - CalculateNativeWinOcclusion ..........: o Chromium para de marcar a janela como oculta
+    #[cfg(target_os = "windows")]
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--disable-background-timer-throttling --disable-backgrounding-occluded-windows \
+         --disable-renderer-backgrounding \
+         --disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion",
+    );
+
     let quit = CustomMenuItem::new("quit".to_string(), "Sair");
     let hide = CustomMenuItem::new("hide".to_string(), "Abrir/Esconder");
     let tray_menu = SystemTrayMenu::new()
@@ -439,6 +488,9 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
+        .manage(RendererWatchdog {
+            last_ping: std::sync::Mutex::new(std::time::Instant::now()),
+        })
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -485,7 +537,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_printers,
             print_receipt,
-            test_printer
+            test_printer,
+            renderer_alive
         ])
         .setup(|app| {
             // Garante que o app sempre inicie junto com o Windows (na bandeja).
@@ -500,6 +553,63 @@ fn main() {
                 let window = app.get_window("main").unwrap();
                 window.hide().unwrap();
             }
+
+            // Watchdog da interface. Thread NATIVA de propósito: se o webview congelar,
+            // nada que dependa dele (inclusive um timer JS) serve para detectar a falha.
+            let handle = app.handle();
+            std::thread::spawn(move || {
+                let mut reload_tried = false;
+                let mut show_tried = false;
+
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+
+                    let silent_secs = {
+                        let state = handle.state::<RendererWatchdog>();
+                        let elapsed = state.last_ping.lock().ok().map(|last| last.elapsed());
+                        match elapsed {
+                            Some(d) => d.as_secs(),
+                            // Mutex envenenado: não há leitura confiável, então não age.
+                            None => continue,
+                        }
+                    };
+
+                    if silent_secs < RENDERER_SILENCE_RELOAD_SECS {
+                        reload_tried = false;
+                        show_tried = false;
+                        continue;
+                    }
+
+                    let window = match handle.get_window("main") {
+                        Some(w) => w,
+                        None => continue,
+                    };
+
+                    if !reload_tried {
+                        eprintln!(
+                            "[watchdog] interface calada há {}s — recarregando",
+                            silent_secs
+                        );
+                        let _ = window.eval("window.location.reload()");
+                        reload_tried = true;
+                        continue;
+                    }
+
+                    if silent_secs >= RENDERER_SILENCE_SHOW_SECS && !show_tried {
+                        eprintln!(
+                            "[watchdog] interface calada há {}s mesmo após recarregar — exibindo a janela",
+                            silent_secs
+                        );
+                        // Mostrar descongela o webview no Chromium e deixa a falha visível
+                        // para a equipe. A janela FICA aberta: escondê-la de novo poderia
+                        // recongelar exatamente o que estamos tentando salvar.
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        show_tried = true;
+                    }
+                }
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())
