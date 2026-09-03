@@ -28,3 +28,11 @@ npm-debug.log*
 
 # Env local (nunca commitar)
 .env
+
+# Chave de assinatura do updater (NUNCA commitar).
+# Ela assina o que entra nas lojas: vazada, alguem pode publicar uma atualizacao
+# maliciosa que os apps instalados aceitariam como nossa. E esta pasta e espelhada
+# para o repositorio PUBLICO, entao um commit por acidente a tornaria mundialmente
+# legivel. O par gerado pelo `tauri signer generate` sai como <nome>.key e <nome>.key.pub.
+*.key
+*.key.pub
