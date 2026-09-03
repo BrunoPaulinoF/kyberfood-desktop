@@ -177,6 +177,14 @@ type PrintFontSize = 'small' | 'normal' | 'large';
 interface PrintConfig {
   fontSize: PrintFontSize;
   paperWidth: 32 | 48; // 32 = 58mm, 48 = 80mm
+  /**
+   * Vias da MESMA comanda em CADA pedido novo, escolhidas pelo lojista em Integrações.
+   *
+   * É por COMPUTADOR, e é isso que o lojista quer: com o app em dois PCs, cada um imprime as
+   * suas vias na própria impressora. Quem sabe em qual máquina está é o app — o servidor não
+   * tem como mandar "imprima neste PC".
+   */
+  copies: number;
   showStoreAddress: boolean;
   showDateTime: boolean;
   showCustomerPhone: boolean;
@@ -191,6 +199,7 @@ const DEFAULT_PRINT_CONFIG: PrintConfig = {
   fontSize: 'normal',
   // 80mm (48 colunas) é o padrão do mercado das impressoras térmicas.
   paperWidth: 48,
+  copies: 1,
   showStoreAddress: true,
   showDateTime: true,
   showCustomerPhone: true,
@@ -216,6 +225,20 @@ const PRINT_JOB_MAX_AGE_MS = 2 * 60_000;
 /** Varredura de segurança da fila, para quando o realtime não entregar o INSERT. */
 const PRINT_JOB_SWEEP_MS = 15_000;
 
+/**
+ * Teto de vias por pedido. ESPELHA MAX_PRINT_COPIES de src/lib/desktop-print-config.ts: o
+ * painel não deixa escolher mais que isso, e aqui é a rede contra um valor estranho virar
+ * meia bobina em cada pedido.
+ */
+const MAX_PRINT_COPIES = 3;
+
+/** Vias válidas: inteiro de 1 a MAX_PRINT_COPIES. Valor ilegível cai em 1, nunca em papel a mais. */
+function normalizePrintCopies(value: any): number {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return Math.min(parsed, MAX_PRINT_COPIES);
+}
+
 function normalizePrintConfig(value: any): PrintConfig {
   const raw = value && typeof value === 'object' ? value : {};
   const fontSize: PrintFontSize = raw.fontSize === 'small' || raw.fontSize === 'large' ? raw.fontSize : 'normal';
@@ -225,6 +248,7 @@ function normalizePrintConfig(value: any): PrintConfig {
   return {
     fontSize,
     paperWidth,
+    copies: normalizePrintCopies(raw.copies),
     showStoreAddress: bool(raw.showStoreAddress, true),
     showDateTime: bool(raw.showDateTime, true),
     showCustomerPhone: bool(raw.showCustomerPhone, true),
@@ -702,6 +726,15 @@ function App() {
   // impede o realtime e o polling (que rodam em paralelo) de mandarem a mesma comanda
   // duas vezes. Sem ele, mover a marcação para depois do sucesso abriria duplicata.
   const printingOrderIdsRef = useRef<Set<string>>(new Set());
+  /**
+   * Quantas vias de cada pedido JÁ SAÍRAM nesta máquina.
+   *
+   * Sem isto, uma falha na 2ª via faria a retentativa do polling imprimir a comanda INTEIRA
+   * de novo — a cozinha receberia a 1ª via duas vezes. Com o contador, a retentativa continua
+   * de onde parou, e o pedido só é dado como impresso quando TODAS as vias saíram: nenhum
+   * pedido fica com menos vias do que o lojista configurou.
+   */
+  const printedViasRef = useRef<Map<string, number>>(new Map());
   // Linha de base: na 1ª sincronização após o login NÃO alertamos os pedidos que
   // já existiam; só os que chegarem depois disparam som/impressão.
   const baselineDoneRef = useRef(false);
@@ -1086,6 +1119,7 @@ function App() {
     // Nova sessão/loja: zera a linha de base (não a reaproveita entre lojas).
     seenOrderIdsRef.current = new Set();
     printedOrderIdsRef.current = new Set();
+    printedViasRef.current = new Map();
     baselineDoneRef.current = false;
     syncFromServer(store.id);
     const interval = setInterval(() => syncFromServer(store.id), 10 * 1000);
@@ -1355,7 +1389,7 @@ function App() {
   // Devolve `true` só quando a comanda foi ACEITA pelo spooler. Quem chama usa isso para
   // decidir se marca o pedido como impresso — falso significa "tente de novo", e é o que
   // impede uma falha momentânea de virar comanda perdida.
-  const printOrder = async (order: Order): Promise<boolean> => {
+  const printOrder = async (order: Order, options?: { copies?: number }): Promise<boolean> => {
     // Sem impressora configurada não há para onde imprimir: o app vive na
     // bandeja, então o diálogo do window.open(...).print() nunca seria visto.
     // Mostra um aviso e deixa o pedido disponível para reimpressão manual.
@@ -1365,19 +1399,47 @@ function App() {
       notifyPrintFailure(order, 'Nenhuma impressora configurada');
       return false;
     }
+    // REIMPRESSÃO SAI SEMPRE EM UMA VIA (decisão de produto): quem aperta o botão quer uma
+    // folha na mão, e o pedido já saiu no número de vias configurado quando chegou.
+    const reimpressao = options?.copies !== undefined;
+    const totalVias = reimpressao ? Math.max(1, options!.copies!) : normalizePrintCopies(printConfigRef.current.copies);
+    // De onde continuar: a via que falhou na tentativa anterior, nunca a comanda inteira.
+    const jaSairam = reimpressao ? 0 : (printedViasRef.current.get(order.id) || 0);
+    if (jaSairam >= totalVias) return true;
+
     try {
       // Generate plain text receipt for thermal printer (respeita a config do lojista)
       const cfg = printConfigRef.current;
       const receiptText = encodeReceiptText(buildReceiptDoc(order, store!, cfg)) + '\n\n\n';
 
-      // Invoke Rust print command
-      await invoke('print_receipt', {
-        printerName,
-        content: receiptText,
-        width: cfg.paperWidth,
-        fontSize: FONT_SIZE_PT[cfg.fontSize],
-      });
+      // UMA CHAMADA POR VIA: o build_escpos do Rust corta o papel no fim de cada impressão, e
+      // o texto repetido numa chamada só sairia como uma tira única para alguém rasgar no meio.
+      for (let via = jaSairam + 1; via <= totalVias; via += 1) {
+        try {
+          // Invoke Rust print command
+          await invoke('print_receipt', {
+            printerName,
+            content: receiptText,
+            width: cfg.paperWidth,
+            fontSize: FONT_SIZE_PT[cfg.fontSize],
+          });
+        } catch (err) {
+          if (via === 1) throw err;
+          // Vias anteriores JÁ SAÍRAM: reimprimir a comanda inteira daria a mesma via duas
+          // vezes para a cozinha. Guarda o que já saiu e devolve `false` — o polling volta em
+          // 10s e imprime só o que falta, até o pedido ter todas as vias.
+          console.error(`Erro ao imprimir a ${via}a via:`, err);
+          printedViasRef.current.set(order.id, via - 1);
+          setPrintError(`A ${via}ª via do pedido ${orderDisplayNumber(order)} não saiu — verifique a impressora`);
+          notifyPrintFailure(order, `A ${via}ª via não saiu na impressora "${printerName}"`);
+          return false;
+        }
+        if (!reimpressao) printedViasRef.current.set(order.id, via);
+      }
 
+      // Todas as vias saíram: o contador não serve mais (quem lembra do pedido impresso é o
+      // printedOrderIdsRef) e ficaria crescendo sem fim numa loja de movimento.
+      printedViasRef.current.delete(order.id);
       setPrintError(null);
       console.log('Order printed successfully');
       return true;
@@ -1680,6 +1742,7 @@ function App() {
     // Zera o estado local; o onAuthStateChange também refletirá o SIGNED_OUT.
     seenOrderIdsRef.current = new Set();
     printedOrderIdsRef.current = new Set();
+    printedViasRef.current = new Map();
     baselineDoneRef.current = false;
     setNewOrders([]);
     setInProgressOrders([]);
@@ -1944,7 +2007,7 @@ function App() {
                 order={order}
                 isNew
                 onSelect={() => setSelectedOrder(order)}
-                onPrint={() => printOrder(order)}
+                onPrint={() => printOrder(order, { copies: 1 })}
                 onAccept={() => updateOrderStatus(order.id, 'confirmed')}
                 onReject={() => updateOrderStatus(order.id, 'cancelled')}
               />
@@ -1964,7 +2027,7 @@ function App() {
           {selectedOrder ? (
             <OrderDetails 
               order={selectedOrder} 
-              onPrint={() => printOrder(selectedOrder)}
+              onPrint={() => printOrder(selectedOrder, { copies: 1 })}
               onUpdateStatus={(status) => updateOrderStatus(selectedOrder.id, status)}
             />
           ) : (
@@ -2010,7 +2073,7 @@ function App() {
                 </div>
                 {/* Reimprime a comanda direto, sem precisar abrir os detalhes. */}
                 <button
-                  onClick={(e) => { e.stopPropagation(); printOrder(order); }}
+                  onClick={(e) => { e.stopPropagation(); printOrder(order, { copies: 1 }); }}
                   className="mt-2 w-full flex items-center justify-center gap-1.5 bg-gray-800 hover:bg-gray-900 text-gray-200 text-xs font-medium py-1.5 rounded-md border border-gray-600 transition-colors"
                   title="Reimprimir comanda"
                 >
