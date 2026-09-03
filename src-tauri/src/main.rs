@@ -132,6 +132,22 @@ fn to_ascii_bytes(text: &str) -> Vec<u8> {
     out
 }
 
+/// Prefixo (STX) que o front usa para marcar uma linha em DESTAQUE.
+///
+/// É um caractere de CONTROLE de propósito: o front limpa os caracteres de controle do
+/// conteúdo do pedido ANTES de aplicar esta marca, então nenhum campo escrito pelo cliente
+/// (nome, observação) consegue forjar uma linha em negrito.
+/// ESPELHA RECEIPT_EMPHASIS_PREFIX de src/lib/desktop-print-config.ts no app web.
+const EMPHASIS_PREFIX: char = '\u{0002}';
+
+/// Separa a marca de destaque do texto da linha.
+fn split_emphasis(line: &str) -> (&str, bool) {
+    match line.strip_prefix(EMPHASIS_PREFIX) {
+        Some(rest) => (rest, true),
+        None => (line, false),
+    }
+}
+
 /// Monta o buffer de bytes ESC/POS da comanda a partir do texto já formatado
 /// (linhas montadas pelo front, com largura de coluna correta). Isto é o que
 /// impressoras térmicas entendem nativamente — sem depender de PDF nem driver GDI.
@@ -146,16 +162,33 @@ fn build_escpos(content: &str, font_pt: f64) -> Vec<u8> {
     // pelo front continuar válido): Fonte B (menor) / Fonte A / altura dupla.
     if font_pt <= 7.5 {
         bytes.extend_from_slice(&[0x1B, 0x4D, 0x01]); // ESC M 1 -> Fonte B (compacta)
-    } else if font_pt >= 11.0 {
-        bytes.extend_from_slice(&[0x1D, 0x21, 0x01]); // GS ! 0x01 -> altura dupla
     } else {
         bytes.extend_from_slice(&[0x1B, 0x4D, 0x00]); // ESC M 0 -> Fonte A (padrão)
     }
+    // Altura base: "grande" já sai em altura dupla. Guardamos o valor para RESTAURAR
+    // depois de cada linha em destaque — sem isso a comanda inteira herdaria o destaque.
+    let base_size: u8 = if font_pt >= 11.0 { 0x01 } else { 0x00 };
+    bytes.extend_from_slice(&[0x1D, 0x21, base_size]); // GS ! -> altura (largura normal)
 
     // Corpo: cada linha do texto vira bytes ASCII + avanço de linha (LF).
+    // Linha prefixada por EMPHASIS_PREFIX sai em NEGRITO + ALTURA DUPLA: é o tipo do
+    // pedido (entrega/retirada) e as observações, que a cozinha precisa enxergar de longe.
+    // Só a ALTURA dobra — largura dupla mudaria a contagem de colunas e quebraria todo o
+    // alinhamento montado pelo front.
     for line in content.lines() {
-        bytes.extend_from_slice(&to_ascii_bytes(line));
+        let (text, strong) = split_emphasis(line);
+        if strong {
+            bytes.extend_from_slice(&[0x1B, 0x45, 0x01]); // ESC E 1 -> negrito
+            bytes.extend_from_slice(&[0x1D, 0x21, 0x01]); // GS ! 0x01 -> altura dupla
+        }
+        bytes.extend_from_slice(&to_ascii_bytes(text));
+        // O LF vai AINDA em altura dupla de propósito: é ele que reserva o espaço vertical
+        // da linha alta. Só depois voltamos ao estado base.
         bytes.push(b'\n');
+        if strong {
+            bytes.extend_from_slice(&[0x1B, 0x45, 0x00]); // negrito off
+            bytes.extend_from_slice(&[0x1D, 0x21, base_size]); // volta à altura base
+        }
     }
 
     // Avança o papel para o conteúdo sair além da lâmina antes do corte.
@@ -318,8 +351,16 @@ fn render_receipt_pdf(content: &str, width: i32, font_pt: f64) -> Result<std::pa
     let font_pt: f64 = font_pt.clamp(6.0, 16.0);
     let line_height: f64 = font_pt * 0.5;
 
-    let lines: Vec<&str> = content.lines().collect();
-    let page_height_mm: f64 = (lines.len() as f64) * line_height + 20.0;
+    // Linha em destaque também sai maior e em negrito no PDF: este caminho é o fallback
+    // das impressoras que não falam ESC/POS, e nelas a comanda tem que ficar igual.
+    const EMPHASIS_SCALE: f64 = 1.4;
+
+    let lines: Vec<(&str, bool)> = content.lines().map(split_emphasis).collect();
+    let content_height_mm: f64 = lines
+        .iter()
+        .map(|(_, strong)| if *strong { line_height * EMPHASIS_SCALE } else { line_height })
+        .sum();
+    let page_height_mm: f64 = content_height_mm + 20.0;
 
     let (doc, page1, layer1) =
         PdfDocument::new("Receipt", Mm(paper_width_mm), Mm(page_height_mm), "Layer 1");
@@ -327,11 +368,16 @@ fn render_receipt_pdf(content: &str, width: i32, font_pt: f64) -> Result<std::pa
     let font = doc
         .add_builtin_font(BuiltinFont::Courier)
         .map_err(|e| e.to_string())?;
+    let font_bold = doc
+        .add_builtin_font(BuiltinFont::CourierBold)
+        .map_err(|e| e.to_string())?;
 
     let mut y_pos: f64 = page_height_mm - 8.0;
-    for line in lines {
-        current_layer.use_text(line, font_pt, Mm(2.0), Mm(y_pos), &font);
-        y_pos -= line_height;
+    for (text, strong) in lines {
+        let size = if strong { font_pt * EMPHASIS_SCALE } else { font_pt };
+        let face = if strong { &font_bold } else { &font };
+        current_layer.use_text(text, size, Mm(2.0), Mm(y_pos), face);
+        y_pos -= if strong { line_height * EMPHASIS_SCALE } else { line_height };
         if y_pos < 3.0 {
             break;
         }

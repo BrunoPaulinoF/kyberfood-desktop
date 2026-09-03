@@ -159,6 +159,18 @@ const DEFAULT_PRINT_CONFIG: PrintConfig = {
 // Tamanho da fonte (em pt) enviado ao comando de impressão do Rust.
 const FONT_SIZE_PT: Record<PrintFontSize, number> = { small: 7, normal: 9, large: 12 };
 
+/**
+ * Idade máxima de um job de impressão vindo do painel que ainda vale imprimir.
+ *
+ * ESPELHA PRINT_JOB_MAX_AGE_MS de src/lib/desktop-print-jobs.ts no app web. Protege o caso
+ * em que o painel morreu no meio da espera (aba fechada, queda de rede) e não cancelou o
+ * job: sem o teto, o app imprimiria o fechamento de horas atrás ao reconectar o realtime.
+ */
+const PRINT_JOB_MAX_AGE_MS = 2 * 60_000;
+
+/** Varredura de segurança da fila, para quando o realtime não entregar o INSERT. */
+const PRINT_JOB_SWEEP_MS = 15_000;
+
 function normalizePrintConfig(value: any): PrintConfig {
   const raw = value && typeof value === 'object' ? value : {};
   const fontSize: PrintFontSize = raw.fontSize === 'small' || raw.fontSize === 'large' ? raw.fontSize : 'normal';
@@ -184,6 +196,8 @@ interface Order {
   id: string;
   order_number?: string | null;
   created_at: string;
+  /** Última escrita no pedido — para o PIX é o instante em que o pagamento confirmou. */
+  updated_at?: string | null;
   status: string;
   total: number;
   subtotal: number;
@@ -215,6 +229,8 @@ interface Order {
         type?: string;
       }>;
     } | null;
+    /** 'pickup' | 'delivery' — tipo do pedido gravado na criação pelo app web. */
+    order_type?: string | null;
   } | null;
 }
 
@@ -309,6 +325,12 @@ interface OrderItem {
   // Tamanho escolhido (colunas novas em order_items; pedidos antigos não têm).
   size_id?: string | null;
   size_name?: string | null;
+  // Item de CORTESIA (brinde por valor mínimo). Pedidos anteriores à feature não têm.
+  is_gift?: boolean | null;
+  // Produto vendido POR PESO (self-service por quilo): gramas do item e o que o CLIENTE
+  // pediu ('weight' = gramas, 'amount' = reais). Pedidos anteriores à feature não têm.
+  weight_grams?: number | string | null;
+  weight_basis?: string | null;
 }
 
 interface Store {
@@ -334,6 +356,46 @@ function orderDisplayNumber(order: { order_number?: string | null; id: string })
   const stored = order.order_number;
   if (stored && String(stored).trim()) return String(stored).trim();
   return String(order.id ?? '').slice(0, 8).toUpperCase();
+}
+
+/**
+ * Janela em que um pedido confirmado é considerado "acabou de acontecer" e por isso NÃO
+ * entra na linha de base como já impresso. 5 minutos cobrem com folga o pior caso do
+ * watchdog (120s de silêncio até o reload + o tempo de a página voltar e sincronizar).
+ */
+const BASELINE_RECENT_CONFIRM_MS = 5 * 60 * 1000;
+
+function isRecentlyConfirmed(order: Order): boolean {
+  // `updated_at` é o instante da confirmação (no PIX, quando o pagamento caiu); o
+  // `created_at` cobre a linha antiga que não traga a coluna. Data ilegível volta como
+  // "não é recente" — na dúvida, mantém o comportamento de sempre.
+  const stamp = Date.parse(order.updated_at || order.created_at);
+  if (!Number.isFinite(stamp)) return false;
+  return Date.now() - stamp < BASELINE_RECENT_CONFIRM_MS;
+}
+
+/**
+ * Avisa o balcão de que uma comanda NÃO saiu.
+ *
+ * O app passa a vida escondido na bandeja, então `setPrintError` (texto na tela) não é
+ * visto por ninguém — era por isso que uma falha de impressão sumia sem deixar rastro.
+ * UMA notificação por pedido: o polling retenta a cada 10s e avisar a cada tentativa
+ * viraria spam, que é o jeito mais rápido de a equipe aprender a ignorar o aviso.
+ */
+const printFailureNotifiedIds = new Set<string>();
+function notifyPrintFailure(order: Order, reason: string) {
+  if (printFailureNotifiedIds.has(order.id)) return;
+  printFailureNotifiedIds.add(order.id);
+  try {
+    if (window.Notification && Notification.permission === 'granted') {
+      new Notification('Comanda NÃO impressa', {
+        body: `Pedido ${orderDisplayNumber(order)} — ${reason}. Confira a impressora.`,
+        icon: '/icon.png',
+      });
+    }
+  } catch {
+    /* o aviso é secundário: nunca pode derrubar o caminho da impressão */
+  }
 }
 
 const SETTINGS_STORAGE_KEY = 'kyberfood.desktop.settings';
@@ -591,12 +653,17 @@ function App() {
   // negócio é: imprimir SÓ quando o pedido chega em CONFIRMADO (nunca em
   // 'ai_attention'/aguardando aprovação). Ver processIncomingOrder.
   const printedOrderIdsRef = useRef<Set<string>>(new Set());
+  // Pedidos com impressão EM ANDAMENTO. `printedOrderIdsRef` só recebe o pedido depois
+  // que o spooler aceita a comanda; enquanto a impressão corre, é este conjunto que
+  // impede o realtime e o polling (que rodam em paralelo) de mandarem a mesma comanda
+  // duas vezes. Sem ele, mover a marcação para depois do sucesso abriria duplicata.
+  const printingOrderIdsRef = useRef<Set<string>>(new Set());
   // Linha de base: na 1ª sincronização após o login NÃO alertamos os pedidos que
   // já existiam; só os que chegarem depois disparam som/impressão.
   const baselineDoneRef = useRef(false);
   // Ref sempre apontando para o printOrder mais recente, para o polling (memoizado)
   // imprimir sem capturar um closure antigo.
-  const printOrderRef = useRef<(order: Order) => void>(() => {});
+  const printOrderRef = useRef<(order: Order) => Promise<boolean>>(async () => false);
   const [showSettings, setShowSettings] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -823,15 +890,33 @@ function App() {
     // imprime nada (pedido ainda não aprovado). Se a janela 'confirmed' for
     // perdida (realtime cai + pulo de poll) e o pedido só for avistado já em
     // 'preparing'/'delivering', a comanda ainda sai (1x) — melhor tarde que nunca.
-    let printed = false;
-    if (isConfirmedOrBeyond && settingsRef.current.autoPrint && !printedOrderIdsRef.current.has(order.id)) {
-      printedOrderIdsRef.current.add(order.id);
-      printOrderRef.current(order);
-      printed = true;
+    //
+    // O pedido só entra em `printedOrderIdsRef` DEPOIS que o spooler aceita a comanda.
+    // Marcar antes (como era) transformava qualquer falha — impressora sem papel,
+    // desligada, nenhuma selecionada — em comanda PERDIDA: o pedido ficava marcado como
+    // impresso, o polling nunca tentava de novo, e o único aviso era um texto numa
+    // janela que vive escondida na bandeja. Falhando, o pedido volta à fila e a próxima
+    // passada do polling (10s) tenta outra vez.
+    const canPrint = isConfirmedOrBeyond
+      && settingsRef.current.autoPrint
+      && !printedOrderIdsRef.current.has(order.id)
+      && !printingOrderIdsRef.current.has(order.id);
+
+    if (firstSighting) {
+      setLastOrderInfo({ number: orderDisplayNumber(order), at: Date.now(), printed: false });
     }
 
-    if (firstSighting || printed) {
-      setLastOrderInfo({ number: orderDisplayNumber(order), at: Date.now(), printed });
+    if (canPrint) {
+      printingOrderIdsRef.current.add(order.id);
+      void printOrderRef.current(order)
+        .then((ok) => {
+          if (!ok) return;
+          printedOrderIdsRef.current.add(order.id);
+          setLastOrderInfo({ number: orderDisplayNumber(order), at: Date.now(), printed: true });
+        })
+        .finally(() => {
+          printingOrderIdsRef.current.delete(order.id);
+        });
     }
   }, []);
 
@@ -845,10 +930,28 @@ function App() {
   // existia), para não reimprimir pedidos antigos ao abrir o app.
   const syncFromServer = useCallback(async (storeId: string) => {
     try {
-      const response = await fetch(`${apiUrl}/api/orders?storeId=${storeId}`, {
+      // Pelo cliente NATIVO (httpJson), nunca pelo fetch do webview: este polling é o
+      // PILAR de recebimento de pedidos e o fetch do webview NÃO chega até aqui. A
+      // requisição sai de tauri://localhost com header Authorization, o que obriga o
+      // navegador a um preflight OPTIONS — e o preflight não carrega o Bearer, então o
+      // middleware do site o responde com 307 para /login, sem cabeçalho CORS nenhum.
+      // O navegador então bloqueia a chamada real, o catch abaixo só escreve no console
+      // e o app fica dependendo SÓ do realtime. Foi exatamente assim que o pedido da
+      // Daliane (Leley Tanabi, 30/08/2026 19:46) se perdeu: o realtime do Supabase
+      // reiniciou entre 19:44 e 19:47, ninguém entregou o INSERT nem o UPDATE do
+      // pagamento, e a comanda nunca saiu. O heartbeat já tinha sido migrado para o
+      // caminho nativo pelo MESMO motivo; este ficou para trás.
+      const res = await httpJson<{ orders?: Order[] }>(`${apiUrl}/api/orders?storeId=${storeId}`, {
         headers: await getAuthHeaders(),
       });
-      const data = await response.json();
+      // 401 = sessão expirada. Sem o relogin o polling ficaria mudo até alguém abrir o
+      // app e digitar a senha — e é ele que garante a comanda quando o realtime falha.
+      if (res.status === 401) {
+        void reloginRef.current();
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = res.data;
       if (!data?.orders) return;
       const all = data.orders as Order[];
       const queue = all.filter(o => o.status === 'ai_attention');
@@ -865,7 +968,13 @@ function App() {
         active.forEach(o => {
           if (isAwaitingOnlinePixPayment(o)) return;
           seenOrderIdsRef.current.add(o.id);
-          if (['confirmed', 'preparing', 'delivering'].includes(o.status)) {
+          // Pedido confirmado HÁ POUCO fica FORA da linha de base. A baseline afirma "já
+          // imprimiu" sobre pedidos que ela nunca viu imprimir; num app que recarrega
+          // sozinho (o watchdog nativo dá location.reload() após 120s de silêncio do
+          // webview) isso engole justamente o pedido que acabou de ser confirmado e
+          // ainda não saiu na impressora. Reimprimir uma comanda dos últimos minutos é
+          // um incômodo visível e raro; perdê-la é invisível e custa o pedido.
+          if (['confirmed', 'preparing', 'delivering'].includes(o.status) && !isRecentlyConfirmed(o)) {
             printedOrderIdsRef.current.add(o.id);
           }
         });
@@ -1026,6 +1135,135 @@ function App() {
     };
   }, [isAuthenticated, store, syncFromServer, processIncomingOrder]);
 
+  // ===========================================================================
+  // FILA DE IMPRESSÃO DO PAINEL (desktop_print_jobs)
+  //
+  // O painel monta o documento (hoje, o Fechamento do Dia) e enfileira um job; aqui ele
+  // sai em ESC/POS direto no spooler, com corte no fim. É o que evita o caminho antigo, em
+  // que o navegador imprimia uma folha A4 e a bobina andava até completar a altura dela.
+  //
+  // O JOB É GENÉRICO: ele traz o TEXTO já montado, a largura em colunas e o tamanho da
+  // fonte. O app não sabe o que é um fechamento — impressão nova pedida pelo painel passa a
+  // funcionar sem build novo do desktop, que é atualizado loja a loja.
+  //
+  // QUEM EVITA IMPRESSÃO EM DOBRO É O CAS EM `status`: reivindicamos com
+  // `pending -> printing` e o painel, ao desistir da espera, faz `pending -> cancelled`.
+  // Só um dos dois vence, então o realtime que chega atrasado não reimprime o que o
+  // navegador já imprimiu.
+  // ===========================================================================
+  const printJobSeenRef = useRef<Set<string>>(new Set());
+
+  const finishPrintJob = useCallback(async (jobId: string, status: 'printed' | 'failed', error: string | null) => {
+    try {
+      await supabase
+        .from('desktop_print_jobs')
+        .update({ status, error, finished_at: new Date().toISOString() })
+        .eq('id', jobId);
+    } catch (err) {
+      // O papel já saiu (ou já falhou): não conseguir gravar o desfecho só faz o painel
+      // esperar o prazo dele e imprimir pelo navegador. Nada a desfazer aqui.
+      console.warn('Falha ao registrar o desfecho da impressao:', err);
+    }
+  }, []);
+
+  const runPrintJob = useCallback(async (job: any) => {
+    const jobId = String(job?.id || '');
+    if (!jobId || printJobSeenRef.current.has(jobId)) return;
+    if (job?.status && job.status !== 'pending') return;
+
+    const createdMs = job?.created_at ? new Date(job.created_at).getTime() : NaN;
+    if (Number.isFinite(createdMs) && Date.now() - createdMs > PRINT_JOB_MAX_AGE_MS) return;
+
+    // Reivindicação atômica. Lista vazia = o painel cancelou ou outro dispositivo pegou.
+    let claimed: any = null;
+    try {
+      const { data, error } = await supabase
+        .from('desktop_print_jobs')
+        .update({ status: 'printing', claimed_at: new Date().toISOString(), device_id: getDeviceId() })
+        .eq('id', jobId)
+        .eq('status', 'pending')
+        .select('id, content, paper_width, font_size_pt');
+      if (error) throw error;
+      claimed = Array.isArray(data) ? data[0] : data;
+    } catch (err) {
+      console.warn('Falha ao reivindicar a impressao:', err);
+      return;
+    }
+    if (!claimed) return;
+    printJobSeenRef.current.add(jobId);
+
+    const printerName = settingsRef.current.selectedPrinter;
+    if (!printerName) {
+      setPrintError('Nenhuma impressora configurada — abra Configurações');
+      await finishPrintJob(jobId, 'failed', 'Nenhuma impressora configurada');
+      return;
+    }
+
+    try {
+      // Sem avanço extra de linhas: o build_escpos do Rust já avança o papel e corta. O
+      // pedido de origem foi justamente sobra de papel em branco.
+      await invoke('print_receipt', {
+        printerName,
+        content: String(claimed.content || ''),
+        width: Number(claimed.paper_width) || 48,
+        fontSize: Number(claimed.font_size_pt) || FONT_SIZE_PT.normal,
+      });
+      setPrintError(null);
+      await finishPrintJob(jobId, 'printed', null);
+    } catch (err: any) {
+      setPrintError(`Falha ao imprimir na impressora "${printerName}" — verifique a impressora`);
+      await finishPrintJob(jobId, 'failed', String(err?.message || err).slice(0, 300));
+    }
+  }, [finishPrintJob]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !store) return;
+    let disposed = false;
+
+    // Varredura: pega o que o realtime não entregou (ele cai com frequência neste app —
+    // é o mesmo motivo do polling de pedidos). Só o que ainda está pendente e recente.
+    const sweep = async () => {
+      if (disposed) return;
+      try {
+        const since = new Date(Date.now() - PRINT_JOB_MAX_AGE_MS).toISOString();
+        const { data, error } = await supabase
+          .from('desktop_print_jobs')
+          .select('id, status, created_at')
+          .eq('store_id', store.id)
+          .eq('status', 'pending')
+          .gte('created_at', since)
+          .order('created_at', { ascending: true })
+          .limit(5);
+        if (error || !Array.isArray(data)) return;
+        for (const job of data) {
+          if (disposed) return;
+          await runPrintJob(job);
+        }
+      } catch (err) {
+        console.warn('Falha ao varrer a fila de impressao:', err);
+      }
+    };
+
+    const channel = supabase
+      .channel(`print_jobs:${store.id}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'desktop_print_jobs', filter: `store_id=eq.${store.id}` },
+        (payload) => { if (!disposed) void runPrintJob(payload.new); },
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED' && !disposed) void sweep();
+      });
+
+    const timer = setInterval(() => { void sweep(); }, PRINT_JOB_SWEEP_MS);
+
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+      supabase.removeChannel(channel);
+    };
+  }, [isAuthenticated, store, runPrintJob]);
+
   // Request notification permission
   useEffect(() => {
     if (window.Notification && Notification.permission === 'default') {
@@ -1034,19 +1272,24 @@ function App() {
   }, []);
 
   // Print order
-  const printOrder = async (order: Order) => {
+  //
+  // Devolve `true` só quando a comanda foi ACEITA pelo spooler. Quem chama usa isso para
+  // decidir se marca o pedido como impresso — falso significa "tente de novo", e é o que
+  // impede uma falha momentânea de virar comanda perdida.
+  const printOrder = async (order: Order): Promise<boolean> => {
     // Sem impressora configurada não há para onde imprimir: o app vive na
     // bandeja, então o diálogo do window.open(...).print() nunca seria visto.
     // Mostra um aviso e deixa o pedido disponível para reimpressão manual.
     const printerName = settingsRef.current.selectedPrinter;
     if (!printerName) {
       setPrintError('Nenhuma impressora configurada — abra Configurações');
-      return;
+      notifyPrintFailure(order, 'Nenhuma impressora configurada');
+      return false;
     }
     try {
       // Generate plain text receipt for thermal printer (respeita a config do lojista)
       const cfg = printConfigRef.current;
-      const receiptText = buildReceiptLines(order, store!, cfg).join('\n') + '\n\n\n';
+      const receiptText = encodeReceiptText(buildReceiptDoc(order, store!, cfg)) + '\n\n\n';
 
       // Invoke Rust print command
       await invoke('print_receipt', {
@@ -1058,9 +1301,11 @@ function App() {
 
       setPrintError(null);
       console.log('Order printed successfully');
+      return true;
     } catch (err) {
       console.error('Error printing order:', err);
       setPrintError(`Falha ao imprimir na impressora "${printerName}" — verifique a impressora e reimprima`);
+      notifyPrintFailure(order, `Impressora "${printerName}" não respondeu`);
       // Fallback to browser printing if it fails
       const receiptHtml = generateReceiptHtml(order, store!);
       const printWindow = window.open('', '_blank', 'width=400,height=600');
@@ -1070,6 +1315,9 @@ function App() {
         printWindow.print();
         setTimeout(() => printWindow.close(), 1000);
       }
+      // NÃO é sucesso: com a janela escondida na bandeja o window.print() acima não
+      // imprime nada que alguém veja. O pedido volta à fila para o polling retentar.
+      return false;
     }
   };
 
@@ -1113,10 +1361,12 @@ function App() {
     applyStatusLocally(orderId, status);
     setActionError(null);
     try {
-      const response = await fetch(`${apiUrl}/api/orders/${orderId}/status`, {
+      // Cliente NATIVO, mesmo motivo do polling: o fetch do webview morre no preflight
+      // CORS (o middleware responde 307 ao OPTIONS, que não leva o Bearer).
+      const response = await httpJson<any>(`${apiUrl}/api/orders/${orderId}/status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(await getAuthHeaders()) },
-        body: JSON.stringify({ status }),
+        body: { status },
       });
 
       if (response.ok) {
@@ -1124,8 +1374,7 @@ function App() {
         return;
       }
 
-      let data: any = null;
-      try { data = await response.json(); } catch { /* corpo não-JSON (ex.: 502 de gateway) */ }
+      const data: any = response.data;
 
       if (response.status === 502) {
         // O status FOI salvo no KyberFood; apenas a sincronização com a Saipos
@@ -1947,6 +2196,16 @@ function OrderDetails({
         </div>
         <StatusBadge status={order.status} large />
       </div>
+
+      {/* TIPO DO PEDIDO em destaque, como na comanda impressa: a equipe olha a tela e o
+          papel, e nos dois o tipo precisa ser a primeira coisa que salta aos olhos. */}
+      <div
+        className={`rounded-lg p-3 mb-4 text-center text-xl font-bold tracking-wide ${
+          isPickupOrder(order) ? 'bg-amber-600 text-white' : 'bg-blue-700 text-white'
+        }`}
+      >
+        {isPickupOrder(order) ? 'RETIRADA NO BALCÃO' : 'ENTREGA'}
+      </div>
       
       {/* Customer Info */}
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -1966,15 +2225,17 @@ function OrderDetails({
         </div>
       </div>
       
-      {/* Delivery Address */}
-      <div className="bg-gray-800 rounded-lg p-4 mb-4">
-        <h3 className="font-bold mb-3 flex items-center gap-2">
-          <MapPin className="w-4 h-4" />
-          Endereço de Entrega
-        </h3>
-        <p>{order.delivery_address}</p>
-        <p className="text-gray-400 text-sm">{order.delivery_neighborhood}</p>
-      </div>
+      {/* Endereço só na ENTREGA: em pedido de retirada ele é o da PRÓPRIA LOJA. */}
+      {!isPickupOrder(order) && (
+        <div className="bg-gray-800 rounded-lg p-4 mb-4">
+          <h3 className="font-bold mb-3 flex items-center gap-2">
+            <MapPin className="w-4 h-4" />
+            Endereço de Entrega
+          </h3>
+          <p>{order.delivery_address}</p>
+          <p className="text-gray-400 text-sm">{order.delivery_neighborhood}</p>
+        </div>
+      )}
       
       {/* Items */}
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -2002,15 +2263,29 @@ function OrderDetails({
                     );
                   });
                 })()}
+                {/* PRODUTO POR PESO: onde a balança para, junto do produto. */}
+                {describeItemWeight(item) && (
+                  <p className="text-base font-bold text-amber-300">{describeItemWeight(item)}</p>
+                )}
+                {/* Observação do item em destaque: é instrução de produção, não detalhe. */}
                 {item.notes && (
-                  <p className="text-sm text-gray-400">Obs: {item.notes}</p>
+                  <p className="text-base font-bold text-amber-300">&gt;&gt; OBS: {item.notes}</p>
                 )}
               </div>
-              <p className="text-green-400">R$ {item.subtotal.toFixed(2)}</p>
+              <p className="text-green-400">{item.is_gift ? 'BRINDE' : `R$ ${item.subtotal.toFixed(2)}`}</p>
             </div>
           ))}
         </div>
         
+        {/* OBSERVAÇÃO DO PEDIDO logo abaixo dos itens (antes ficava no fim da tela, depois
+            do pagamento) e em destaque — mesma ordem da comanda impressa. */}
+        {order.notes && (
+          <div className="mt-4 rounded-lg border-2 border-amber-500 bg-amber-950/40 p-3">
+            <p className="text-sm font-bold text-amber-400 mb-1">OBSERVAÇÃO DO PEDIDO</p>
+            <p className="text-lg font-bold text-amber-200">{order.notes}</p>
+          </div>
+        )}
+
         <div className="border-t border-gray-700 mt-4 pt-4 space-y-2">
           <div className="flex justify-between text-sm">
             <span className="text-gray-400">Subtotal</span>
@@ -2041,14 +2316,6 @@ function OrderDetails({
           </span>
         </div>
       </div>
-      
-      {/* Notes */}
-      {order.notes && (
-        <div className="bg-gray-800 rounded-lg p-4 mb-4">
-          <h3 className="font-bold mb-2">Observações</h3>
-          <p className="text-gray-300">{order.notes}</p>
-        </div>
-      )}
       
       {/* Actions */}
       <div className="flex gap-4">
@@ -2294,6 +2561,60 @@ function SettingsModal({
   );
 }
 
+// Rótulo do TIPO do pedido, impresso EM DESTAQUE no topo da comanda.
+// ESPELHA PICKUP_RECEIPT_LABEL / DELIVERY_RECEIPT_LABEL de src/lib/order-pickup.ts no web.
+const PICKUP_RECEIPT_LABEL = '*** RETIRADA ***';
+const DELIVERY_RECEIPT_LABEL = '*** ENTREGA ***';
+
+// Marca de DESTAQUE de uma linha (negrito + altura dupla na térmica). Caractere de
+// CONTROLE de propósito: `stripControlChars` roda ANTES de ela ser aplicada, então nada
+// vindo do pedido (nome, observação do cliente) consegue forjar negrito.
+// ESPELHA RECEIPT_EMPHASIS_PREFIX do web e EMPHASIS_PREFIX (0x02) do src-tauri/src/main.rs.
+const RECEIPT_EMPHASIS_PREFIX = '\u0002';
+
+// ESPELHAM os rótulos de mesmo nome em src/lib/desktop-print-config.ts.
+const ORDER_NOTES_RECEIPT_LABEL = '*** OBSERVACAO DO PEDIDO ***';
+const ITEM_NOTE_RECEIPT_PREFIX = '  >> OBS: ';
+
+/** Uma linha da comanda. `emphasis` sai em negrito e altura dupla na impressora. */
+interface ReceiptLine {
+  text: string;
+  emphasis?: boolean;
+}
+
+// ESPELHA GIFT_RECEIPT_LABEL de src/lib/order-gifts.ts no app web. Item de cortesia sai com
+// este rótulo no lugar do preço: "R$ 0.00" na comanda a cozinha lê como erro de sistema.
+const GIFT_RECEIPT_LABEL = '*** BRINDE ***';
+
+// ESPELHA describeWeightForReceipt/readItemWeight de src/lib/product-weight.ts no app web
+// (projetos separados, não há import entre eles). PRODUTO POR PESO: a linha diz onde a
+// balança para — no PESO, quando o cliente pediu em gramas; no VALOR, quando ele pediu em
+// reais (aí o peso é meta aproximada). Sem ela a comanda traz "1x Misturas por Quilo
+// R$ 15,00" e a cozinha não sabe quanta comida servir.
+function describeItemWeight(item: OrderItem): string | null {
+  const grams = Number(item.weight_grams);
+  if (!Number.isFinite(grams) || grams <= 0) return null;
+  const pesoTexto = grams >= 1000
+    ? `${String(grams / 1000).replace('.', ',')} kg`
+    : `${Math.round(grams)} g`;
+  if (item.weight_basis === 'amount') {
+    const valor = `R$ ${Number(item.subtotal || 0).toFixed(2).replace('.', ',')}`;
+    return `PESAR ATE ${valor} (~${pesoTexto})`;
+  }
+  return `PESO: ${pesoTexto}`;
+}
+
+// Retirada no balcão. ESPELHA isPickupOrder de src/lib/order-pickup.ts (projetos separados,
+// não há import entre eles): flag explícita gravada na criação e, para os pedidos antigos,
+// o rótulo no endereço (pedido manual) ou no início das observações (pedido da IA).
+function isPickupOrder(order: Pick<Order, 'delivery_address' | 'notes' | 'metadata'>): boolean {
+  const flag = String(order.metadata?.order_type || '').trim().toLowerCase();
+  if (flag === 'pickup') return true;
+  if (flag === 'delivery') return false;
+  const pickupText = /^\s*retirada no balc[aã]o/i;
+  return pickupText.test(String(order.delivery_address || '')) || pickupText.test(String(order.notes || ''));
+}
+
 // Sabores da pizza chegam como complementos do grupo "Sabores". Quando há mais de
 // um, cada sabor representa uma fração da pizza (1/2, 1/3...), o que deixa claro na
 // comanda e pra cozinha quanto de cada sabor a pizza leva.
@@ -2326,10 +2647,37 @@ function stripControlChars(value: unknown): string {
   return out;
 }
 
-// Monta as linhas da comanda respeitando a configuração de impressão do lojista.
-// ESPELHA src/lib/desktop-print-config.ts (buildReceiptLines) do app web, para
-// que a pré-visualização mostrada no painel seja fiel à impressão real.
-function buildReceiptLines(order: Order, store: Store, config: PrintConfig): string[] {
+// Quebra um texto livre (observação escrita pelo cliente) em linhas que cabem no papel.
+// ESPELHA wrapText de src/lib/desktop-print-config.ts.
+function wrapText(text: string, width: number, firstPrefix = '', contPrefix = firstPrefix): string[] {
+  const words = String(text).trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+
+  const out: string[] = [];
+  let prefix = firstPrefix;
+  let current = '';
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (current && (prefix + candidate).length > width) {
+      out.push(prefix + current);
+      prefix = contPrefix;
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  out.push(prefix + current);
+  return out;
+}
+
+// Monta a comanda linha a linha, marcando as que saem em DESTAQUE (negrito + altura dupla).
+// ESPELHA src/lib/desktop-print-config.ts (buildReceiptDoc) do app web, para que a
+// pré-visualização mostrada no painel seja fiel à impressão real.
+//
+// Duas decisões vêm do lojista da Q Sabor (22/08/2026): o TIPO do pedido sai EM CIMA em
+// destaque, e a OBSERVAÇÃO DO PEDIDO sai logo ABAIXO DOS ITENS (antes ficava no rodapé,
+// depois do pagamento, no mesmo corpo de letra de todo o resto).
+function buildReceiptDoc(order: Order, store: Store, config: PrintConfig): ReceiptLine[] {
   const width = config.paperWidth;
   const line = (char = '-') => char.repeat(width);
   const center = (text: string) => {
@@ -2339,30 +2687,47 @@ function buildReceiptLines(order: Order, store: Store, config: PrintConfig): str
   };
   const rightAlign = (text: string) => ' '.repeat(Math.max(0, width - text.length)) + text;
 
-  const lines: string[] = [];
-  lines.push(center(store.name.toUpperCase()));
-  if (config.showStoreAddress && store.address) lines.push(center(store.address));
-  lines.push(line('='));
-  lines.push(`PEDIDO: #${orderDisplayNumber(order)}`);
-  if (config.showDateTime) lines.push(formatOrderDateTime(order.created_at, store.timezone));
-  if (order.scheduled_at) lines.push(`AGENDADO P/: ${formatOrderDateTime(order.scheduled_at, store.timezone)}`);
-  lines.push(line());
-  lines.push(`CLIENTE: ${order.customer_name}`);
-  if (config.showCustomerPhone && order.customer_phone) lines.push(`FONE: ${order.customer_phone}`);
-  if (config.showDeliveryAddress && order.delivery_address) lines.push(`END: ${order.delivery_address}`);
-  if (config.showDeliveryAddress && order.delivery_neighborhood) lines.push(`BAIRRO: ${order.delivery_neighborhood}`);
-  lines.push(line('-'));
-  lines.push('ITENS:');
+  const lines: ReceiptLine[] = [];
+  const push = (text: string) => lines.push({ text });
+  const pushStrong = (text: string) => lines.push({ text, emphasis: true });
+
+  const pickup = isPickupOrder(order);
+
+  push(center(store.name.toUpperCase()));
+  if (config.showStoreAddress && store.address) push(center(store.address));
+  push(line('='));
+  // TIPO DO PEDIDO, EM CIMA E EM DESTAQUE. Antes a retirada só aparecia no MEIO da ficha,
+  // no lugar do endereço, e a entrega não aparecia em lugar nenhum.
+  pushStrong(center(pickup ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL));
+  push(line('='));
+  push(`PEDIDO: #${orderDisplayNumber(order)}`);
+  if (config.showDateTime) push(formatOrderDateTime(order.created_at, store.timezone));
+  if (order.scheduled_at) push(`AGENDADO P/: ${formatOrderDateTime(order.scheduled_at, store.timezone)}`);
+  push(line());
+  push(`CLIENTE: ${order.customer_name}`);
+  if (config.showCustomerPhone && order.customer_phone) push(`FONE: ${order.customer_phone}`);
+  // Retirada não imprime endereço: o endereço de um pedido de retirada é o da PRÓPRIA LOJA
+  // e a comanda saía como se houvesse entrega a fazer. Quem diz o tipo é o marcador do topo,
+  // que ignora showDeliveryAddress de propósito — é o TIPO do pedido, não o endereço.
+  if (!pickup) {
+    if (config.showDeliveryAddress && order.delivery_address) push(`END: ${order.delivery_address}`);
+    if (config.showDeliveryAddress && order.delivery_neighborhood) push(`BAIRRO: ${order.delivery_neighborhood}`);
+  }
+  push(line('-'));
+  push('ITENS:');
 
   order.items?.forEach(item => {
     const itemLine = `${item.quantity}x ${item.product_name}${item.size_name ? ` (${item.size_name})` : ''}`;
-    const priceLine = `R$ ${item.subtotal.toFixed(2)}`;
+    const priceLine = item.is_gift ? GIFT_RECEIPT_LABEL : `R$ ${item.subtotal.toFixed(2)}`;
     if (itemLine.length + priceLine.length + 1 <= width) {
-      lines.push(`${itemLine}${' '.repeat(width - itemLine.length - priceLine.length)}${priceLine}`);
+      push(`${itemLine}${' '.repeat(width - itemLine.length - priceLine.length)}${priceLine}`);
     } else {
-      lines.push(itemLine);
-      lines.push(rightAlign(priceLine));
+      push(itemLine);
+      push(rightAlign(priceLine));
     }
+    // PRODUTO POR PESO: onde a balança para, em destaque e colado no produto.
+    const weightLine = describeItemWeight(item);
+    if (weightLine) pushStrong(`  ${weightLine}`);
     // Complementos pagos (borda, adicionais): a cozinha PRECISA vê-los.
     // Sabores de pizza ganham a fração correspondente (1/2, 1/3...).
     const flavorCount = countFlavors(item.complements);
@@ -2371,37 +2736,43 @@ function buildReceiptLines(order: Order, store: Store, config: PrintConfig): str
       if (!compName) return;
       const compPrice = Number(comp?.price) || 0;
       const label = `${flavorFractionPrefix(comp, flavorCount)}${compName}`;
-      lines.push(compPrice > 0 ? `  + ${label} (R$ ${compPrice.toFixed(2)})` : `  + ${label}`);
+      push(compPrice > 0 ? `  + ${label} (R$ ${compPrice.toFixed(2)})` : `  + ${label}`);
     });
-    if (config.showItemNotes && item.notes) lines.push(`  Obs: ${item.notes}`);
+    // Observação do ITEM em destaque, colada no produto a que pertence.
+    if (config.showItemNotes && item.notes) {
+      wrapText(item.notes, width, ITEM_NOTE_RECEIPT_PREFIX, '     ').forEach(pushStrong);
+    }
   });
 
-  lines.push(line());
-  lines.push(rightAlign(`Subtotal: R$ ${order.subtotal.toFixed(2)}`));
-  lines.push(rightAlign(`Entrega: R$ ${order.delivery_fee.toFixed(2)}`));
+  // OBSERVAÇÃO DO PEDIDO logo abaixo dos ITENS (antes ficava no rodapé, depois do
+  // pagamento) e em destaque: é instrução de PRODUÇÃO, não detalhe de conferência.
+  if (config.showOrderNotes && order.notes) {
+    push(line('-'));
+    pushStrong(ORDER_NOTES_RECEIPT_LABEL);
+    wrapText(order.notes, width).forEach(pushStrong);
+  }
+
+  push(line());
+  push(rightAlign(`Subtotal: R$ ${order.subtotal.toFixed(2)}`));
+  push(rightAlign(`Entrega: R$ ${order.delivery_fee.toFixed(2)}`));
   if (order.discount_amount && order.discount_amount > 0) {
     const cupom = order.coupon_code ? ` (${order.coupon_code})` : '';
-    lines.push(rightAlign(`Desconto${cupom}: -R$ ${order.discount_amount.toFixed(2)}`));
+    push(rightAlign(`Desconto${cupom}: -R$ ${order.discount_amount.toFixed(2)}`));
   }
   if (order.increase_amount && order.increase_amount > 0) {
-    lines.push(rightAlign(`Acrescimo: +R$ ${order.increase_amount.toFixed(2)}`));
+    push(rightAlign(`Acrescimo: +R$ ${order.increase_amount.toFixed(2)}`));
   }
-  lines.push(rightAlign(`TOTAL: R$ ${order.total.toFixed(2)}`));
-  lines.push(line('='));
+  push(rightAlign(`TOTAL: R$ ${order.total.toFixed(2)}`));
+  push(line('='));
 
   if (config.showPayment && (order.payment_method || order.metadata?.saipos?.payment_types?.length)) {
-    lines.push(`PAGAMENTO: ${formatOrderPayments(order)}`);
-    lines.push(`STATUS: ${order.payment_status === 'paid' ? 'PAGO' : 'PENDENTE'}`);
-  }
-
-  if (config.showOrderNotes && order.notes) {
-    lines.push(line('-'));
-    lines.push(`OBS: ${order.notes}`);
+    push(`PAGAMENTO: ${formatOrderPayments(order)}`);
+    push(`STATUS: ${order.payment_status === 'paid' ? 'PAGO' : 'PENDENTE'}`);
   }
 
   if (config.footerText.trim()) {
-    lines.push(line('='));
-    lines.push(center(config.footerText));
+    push(line('='));
+    push(center(config.footerText));
   }
 
   // TRAVA ANTI-FORJA: nenhum campo do pedido pode criar uma LINHA NOVA na comanda.
@@ -2409,7 +2780,17 @@ function buildReceiptLines(order: Order, store: Store, config: PrintConfig): str
   // "STATUS: PAGO" logo abaixo do "CLIENTE:" e a comanda saía idêntica à de um
   // pedido pago. A troca é por espaço justamente para o alinhamento em colunas
   // montado acima continuar válido.
-  return lines.map(stripControlChars);
+  //
+  // É TAMBÉM O QUE IMPEDE FORJAR DESTAQUE: a marca de destaque é aplicada DEPOIS desta
+  // limpeza (`encodeReceiptText`), então nada vindo do pedido emite uma linha em negrito.
+  return lines.map((l) => ({ ...l, text: stripControlChars(l.text) }));
+}
+
+// Serializa a comanda para o comando de impressão: uma linha por linha, com as destacadas
+// prefixadas pela marca de controle que o Rust converte em ESC/POS.
+// ESPELHA encodeReceiptText do app web.
+function encodeReceiptText(doc: ReceiptLine[]): string {
+  return doc.map((l) => (l.emphasis ? RECEIPT_EMPHASIS_PREFIX + l.text : l.text)).join('\n');
 }
 
 // Escapa strings vindas do pedido (nome do cliente, observações etc.) antes de
@@ -2430,18 +2811,35 @@ function generateReceiptHtml(order: Order, store: Store): string {
   lines.push(`<div style="text-align: center; font-weight: bold; font-size: 14px;">${escapeHtml(store.name)}</div>`);
   lines.push(`<div style="text-align: center; font-size: 10px;">${escapeHtml(store.address || '')}</div>`);
   lines.push('<hr>');
+  lines.push(
+    `<div style="text-align: center; font-weight: bold; font-size: 16px;">` +
+      `${escapeHtml(isPickupOrder(order) ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL)}</div>`,
+  );
+  lines.push('<hr>');
   lines.push(`<div><strong>PEDIDO: #${escapeHtml(orderDisplayNumber(order))}</strong></div>`);
   lines.push(`<div>${escapeHtml(formatOrderDateTime(order.created_at, store.timezone))}</div>`);
   lines.push('<hr>');
   lines.push(`<div>CLIENTE: ${escapeHtml(order.customer_name)}</div>`);
   lines.push(`<div>FONE: ${escapeHtml(order.customer_phone)}</div>`);
-  lines.push(`<div>END: ${escapeHtml(order.delivery_address)}</div>`);
+  // Retirada não imprime endereço (é o da própria loja) — quem diz o tipo é o marcador
+  // em destaque no TOPO, montado logo acima.
+  if (!isPickupOrder(order)) {
+    lines.push(`<div>END: ${escapeHtml(order.delivery_address)}</div>`);
+  }
   lines.push('<hr>');
   lines.push('<div><strong>ITENS:</strong></div>');
 
   order.items?.forEach(item => {
     const sizeText = item.size_name ? ` (${item.size_name})` : '';
-    lines.push(`<div>${item.quantity}x ${escapeHtml(`${item.product_name}${sizeText}`)} - R$ ${item.subtotal.toFixed(2)}</div>`);
+    const priceText = item.is_gift ? GIFT_RECEIPT_LABEL : `R$ ${item.subtotal.toFixed(2)}`;
+    lines.push(`<div>${item.quantity}x ${escapeHtml(`${item.product_name}${sizeText}`)} - ${escapeHtml(priceText)}</div>`);
+    // PRODUTO POR PESO: onde a balança para.
+    const weightText = describeItemWeight(item);
+    if (weightText) {
+      lines.push(
+        `<div style="font-size: 14px; font-weight: bold; margin-left: 10px;">${escapeHtml(weightText)}</div>`,
+      );
+    }
     // Complementos pagos (borda, adicionais): a cozinha PRECISA vê-los.
     // Sabores de pizza ganham a fração correspondente (1/2, 1/3...).
     const flavorCount = countFlavors(item.complements);
@@ -2454,9 +2852,19 @@ function generateReceiptHtml(order: Order, store: Store): string {
       lines.push(`<div style="font-size: 10px; margin-left: 10px;">${escapeHtml(compText)}</div>`);
     });
     if (item.notes) {
-      lines.push(`<div style="font-size: 10px; margin-left: 10px;">Obs: ${escapeHtml(item.notes)}</div>`);
+      lines.push(
+        `<div style="font-size: 14px; font-weight: bold; margin-left: 10px;">` +
+          `&gt;&gt; OBS: ${escapeHtml(item.notes)}</div>`,
+      );
     }
   });
+
+  // OBSERVAÇÃO DO PEDIDO logo abaixo dos itens, em destaque (antes ia para o rodapé).
+  if (order.notes) {
+    lines.push('<hr>');
+    lines.push(`<div style="font-weight: bold;">${escapeHtml(ORDER_NOTES_RECEIPT_LABEL)}</div>`);
+    lines.push(`<div style="font-size: 15px; font-weight: bold;">${escapeHtml(order.notes)}</div>`);
+  }
 
   lines.push('<hr>');
   lines.push(`<div style="text-align: right;">Subtotal: R$ ${order.subtotal.toFixed(2)}</div>`);
@@ -2465,10 +2873,6 @@ function generateReceiptHtml(order: Order, store: Store): string {
   lines.push('<hr>');
   lines.push(`<div>PAGAMENTO: ${escapeHtml(formatOrderPayments(order))} ${order.payment_status === 'paid' ? '✓' : ''}</div>`);
 
-  if (order.notes) {
-    lines.push(`<div>OBS: ${escapeHtml(order.notes)}</div>`);
-  }
-  
   lines.push('<hr>');
   lines.push('<div style="text-align: center;">OBRIGADO!</div>');
   
