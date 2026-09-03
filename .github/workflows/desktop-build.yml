@@ -172,22 +172,45 @@ jobs:
         # instalação em paralelo — duas versões do app na mesma máquina, uma delas invisível
         # para quem só usa o atalho de sempre.
         #
-        # Sem updater ligado o passo não acha nada e segue em silêncio: o build continua
-        # publicando o instalador manual, como sempre.
+        # Sem updater ligado o passo sai em silêncio (a decisão vem do passo anterior, não
+        # da ausência do arquivo): o build continua publicando o instalador manual, como
+        # sempre. LIGADO e sem pacote, ele FALHA — era esse o caso do build #17, que saiu
+        # verde com a atualização automática desligada sem ninguém notar.
         shell: bash
         id: updater_bundle
         run: |
           set -e
-          # O nome vem do tauri-bundler e é "<App>_<versao>_x64-setup.exe.zip" (o zip do
-          # NSIS carrega o .exe dentro). Está documentado em updater/core.rs do tauri
-          # 1.8.3, em "Expected one of" — o updater identifica o tipo pelo arquivo DENTRO
-          # do zip (.exe = NSIS, .msi = MSI), não pelo nome de fora.
-          zip=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe.zip 2>/dev/null | head -n1 || true)
-          sig=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe.zip.sig 2>/dev/null | head -n1 || true)
-          if [ -z "$zip" ] || [ -z "$sig" ]; then
-            echo "Sem pacote de atualizacao (updater desligado neste build)."
+          # NÃO se casa o nome do arquivo. O tauri-bundler 1.x gera
+          # "<App>_<versao>_x64-setup.nsis.zip", mas o comentário "Expected one of" de
+          # updater/core.rs lista "-setup.exe.zip" — porque ele descreve o que o updater
+          # ACEITA, não o que o bundler ESCREVE. Casar o nome errado fez o build #17 sair
+          # verde com o pacote gerado e ignorado, e o latest.json sem o bloco `platforms`:
+          # a atualização automática ficou desligada em silêncio.
+          #
+          # Qualquer .zip da pasta do NSIS é o pacote (o .sig é outra extensão e não casa
+          # neste glob), então a mudança de nome entre versões do Tauri deixa de importar.
+          # Com o updater DESLIGADO o Tauri nem gera pacote de atualizacao, e isso e o
+          # esperado — nao e falha. Por isso a decisao vem do passo anterior, e nao da
+          # ausencia do arquivo: sem essa distincao, o build de quem ainda nao configurou
+          # as chaves passaria a quebrar.
+          if [ "${{ steps.updater.outputs.updater }}" != "true" ]; then
+            echo "Updater desligado neste build; nada a empacotar."
             echo "has_bundle=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          zip=$(ls src-tauri/target/release/bundle/nsis/*.zip 2>/dev/null | head -n1 || true)
+          sig="${zip}.sig"
+          if [ -z "$zip" ]; then
+            echo "::error::O updater esta LIGADO mas nenhum .zip foi gerado em bundle/nsis/. Conteudo:"
+            ls -la src-tauri/target/release/bundle/nsis/ 2>/dev/null || echo "(pasta inexistente)"
+            echo "has_bundle=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ ! -f "$sig" ]; then
+            echo "::error::Pacote encontrado ($zip) mas SEM assinatura ($sig): o app recusaria esta atualizacao."
+            echo "has_bundle=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           cp "$zip" "KyberFood-Update.zip"
           # A assinatura entra no manifesto como TEXTO, e é o que o app confere antes de
