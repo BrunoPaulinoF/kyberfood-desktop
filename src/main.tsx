@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
+import { restoreDeviceStateIfEmpty } from './device-state'
 
 // Rede de segurança contra tela branca: qualquer erro não tratado durante a
 // renderização passa a mostrar uma mensagem legível (com o erro real) em vez de
@@ -91,10 +92,21 @@ class ErrorBoundary extends React.Component<
   }
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </React.StrictMode>,
-)
+function mount() {
+  ReactDOM.createRoot(document.getElementById('root')!).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </React.StrictMode>,
+  )
+}
+
+// A restauração vem ANTES de montar: o App lê o localStorage de forma síncrona ao criar o
+// estado (impressora, som) e ao decidir o relogin automático, então restaurar depois já
+// seria tarde — a loja apareceria sem impressora e na tela de login por um instante, e a
+// configuração recém-lida (vazia) seria regravada por cima da reserva.
+//
+// O `finally` é a trava: a reserva NUNCA pode impedir o app de abrir. Se a leitura falhar,
+// o app sobe exatamente como sobe hoje.
+restoreDeviceStateIfEmpty().catch(() => {}).finally(mount)

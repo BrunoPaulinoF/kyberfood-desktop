@@ -491,6 +491,54 @@ struct RendererWatchdog {
     last_ping: std::sync::Mutex<std::time::Instant>,
 }
 
+/// Estado do DISPOSITIVO guardado FORA do WebView (impressora, som, sessão).
+///
+/// POR QUE EXISTE: as configurações do app viviam só no `localStorage`, que fica no
+/// diretório de dados do WebView2. A atualização automática roda um instalador, e a
+/// documentação do Tauri NÃO garante que esses dados sobrevivem — se não sobrevivessem, a
+/// loja acordaria sem impressora selecionada e deslogada, com o app atualizando sozinho.
+/// Ou seja, o risco só apareceria DEPOIS de a atualização já ter acontecido em todas as
+/// lojas.
+///
+/// Este arquivo vive no diretório de CONFIGURAÇÃO do app, que o instalador não toca, e é a
+/// reserva: o `localStorage` continua sendo a fonte primária (nada mudou no caminho
+/// normal), e isto aqui só responde quando ele volta vazio.
+///
+/// O conteúdo é o mesmo que já estava no `localStorage` — inclusive as credenciais, no
+/// mesmo nível de proteção de antes (o app roda numa máquina da loja e precisa religar
+/// sozinho). Não é segredo novo exposto: é o mesmo segredo, num lugar que sobrevive.
+fn device_state_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path_resolver()
+        .app_config_dir()
+        .ok_or_else(|| "diretorio de configuracao indisponivel".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("device-state.json"))
+}
+
+/// Lê o estado guardado. Ausência de arquivo NÃO é erro: é o primeiro uso.
+#[tauri::command]
+fn read_device_state(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = device_state_path(&app)?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Grava o estado. A escrita é ATÔMICA (arquivo temporário + rename): uma queda de energia
+/// no meio da gravação deixaria um JSON pela metade, e aí a reserva estaria corrompida
+/// justamente no dia em que ela precisa funcionar.
+#[tauri::command]
+fn write_device_state(app: tauri::AppHandle, contents: String) -> Result<(), String> {
+    let path = device_state_path(&app)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Sinal de vida da interface. Só carimba a hora — barato o bastante para rodar a cada 15s.
 #[tauri::command]
 fn renderer_alive(state: tauri::State<'_, RendererWatchdog>) {
@@ -584,7 +632,9 @@ fn main() {
             get_printers,
             print_receipt,
             test_printer,
-            renderer_alive
+            renderer_alive,
+            read_device_state,
+            write_device_state
         ])
         .setup(|app| {
             // Garante que o app sempre inicie junto com o Windows (na bandeja).

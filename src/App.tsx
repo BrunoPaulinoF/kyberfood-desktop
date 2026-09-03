@@ -19,8 +19,15 @@ import {
   CheckCircle2
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/tauri';
+import {
+  SETTINGS_STORAGE_KEY,
+  CREDENTIALS_STORAGE_KEY,
+  writeDeviceStateFile,
+} from './device-state';
 import { getVersion } from '@tauri-apps/api/app';
 import { open as openExternal } from '@tauri-apps/api/shell';
+import { checkUpdate, installUpdate } from '@tauri-apps/api/updater';
+import { relaunch } from '@tauri-apps/api/process';
 import { fetch as tauriFetch, Body, ResponseType } from '@tauri-apps/api/http';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_IPC__' in window;
@@ -98,6 +105,42 @@ async function fetchLatestManifest(): Promise<UpdateManifest | null> {
   return res.data;
 }
 
+/**
+ * Instala a atualização SOZINHO, pelo updater nativo do Tauri.
+ *
+ * POR QUE SÓ NO ARRANQUE: instalar reinicia o app (é o que a própria documentação do Tauri
+ * diz do Windows). No meio do expediente isso derruba o recebimento de pedidos e a
+ * impressão por alguns segundos — e uma comanda perdida custa muito mais que uma
+ * atualização adiada. No arranque, ninguém está esperando comanda ainda.
+ *
+ * Depois disso, a atualização segue existindo como o BOTÃO que já existia: o lojista decide
+ * a hora.
+ *
+ * DEVOLVE `true` só quando de fato vai reiniciar — aí o chamador não deve seguir com a
+ * checagem normal, porque o app está de saída.
+ *
+ * NUNCA lança. Com o updater desligado no build (é o estado enquanto não houver chave de
+ * assinatura), `checkUpdate` rejeita — e o app tem que continuar subindo exatamente como
+ * sobe hoje. Esta função é uma melhoria opcional, nunca um caminho crítico.
+ */
+async function installUpdateOnLaunch(): Promise<boolean> {
+  try {
+    const { shouldUpdate } = await checkUpdate();
+    if (!shouldUpdate) return false;
+
+    // A reserva é gravada ANTES de instalar: se o instalador limpar os dados do WebView,
+    // é ela que devolve impressora, som e sessão no primeiro arranque da versão nova.
+    await writeDeviceStateFile();
+
+    await installUpdate();
+    await relaunch();
+    return true;
+  } catch (err) {
+    console.warn('Atualizacao automatica indisponivel:', err);
+    return false;
+  }
+}
+
 interface UpdateInfo {
   version: string;
   url: string;
@@ -108,6 +151,8 @@ interface UpdateInfo {
 type UpdateCheck =
   | { state: 'idle' }
   | { state: 'checking' }
+  // Instalando e prestes a reiniciar: o lojista precisa saber por que o app vai sumir.
+  | { state: 'installing' }
   | { state: 'up-to-date'; latest: string }
   | { state: 'outdated'; latest: string }
   | { state: 'error' };
@@ -327,10 +372,6 @@ interface OrderItem {
   size_name?: string | null;
   // Item de CORTESIA (brinde por valor mínimo). Pedidos anteriores à feature não têm.
   is_gift?: boolean | null;
-  // Produto vendido POR PESO (self-service por quilo): gramas do item e o que o CLIENTE
-  // pediu ('weight' = gramas, 'amount' = reais). Pedidos anteriores à feature não têm.
-  weight_grams?: number | string | null;
-  weight_basis?: string | null;
 }
 
 interface Store {
@@ -398,7 +439,6 @@ function notifyPrintFailure(order: Order, reason: string) {
   }
 }
 
-const SETTINGS_STORAGE_KEY = 'kyberfood.desktop.settings';
 const DEFAULT_SETTINGS: Settings = {
   autoPrint: true,
   soundEnabled: true,
@@ -460,7 +500,6 @@ const AUTH_STORAGE_KEY = 'kyberfood.desktop.auth';
  * lá) é a pasta de perfil do usuário do Windows. O base64 não é criptografia, é só para o
  * arquivo não expor a senha a olho nu.
  */
-const CREDENTIALS_STORAGE_KEY = 'kyberfood.desktop.credentials';
 
 /**
  * Cadência do heartbeat. O servidor dá a loja como offline após 5 min sem batida
@@ -475,6 +514,8 @@ function saveCredentials(credentials: SavedCredentials) {
   try {
     const json = JSON.stringify(credentials);
     localStorage.setItem(CREDENTIALS_STORAGE_KEY, btoa(String.fromCharCode(...new TextEncoder().encode(json))));
+    // Espelha na reserva: é o que mantém a loja conectada depois de uma atualização.
+    void writeDeviceStateFile();
   } catch {
     /* sem storage o relogin automático não existe, mas o login normal continua */
   }
@@ -496,6 +537,9 @@ function loadCredentials(): SavedCredentials | null {
 function clearCredentials() {
   try {
     localStorage.removeItem(CREDENTIALS_STORAGE_KEY);
+    // A reserva TAMBÉM some: sem isto o botão Sair não desconectaria de verdade — a
+    // restauração devolveria a credencial apagada no próximo arranque.
+    void writeDeviceStateFile();
   } catch {
     /* ignora */
   }
@@ -721,10 +765,24 @@ function App() {
   }, []);
 
   useEffect(() => {
-    checkForUpdate();
-    // Reverifica a cada 6 horas enquanto o app estiver aberto.
+    let cancelled = false;
+
+    // No ARRANQUE a atualização é aplicada sozinha (o app reinicia já na versão nova).
+    // Não instalando nada — updater desligado, sem versão nova, ou falha — cai na checagem
+    // de sempre, que só AVISA. Ou seja: esta linha nunca tira um aviso que já existia.
+    void (async () => {
+      const restarting = await installUpdateOnLaunch();
+      if (restarting || cancelled) return;
+      checkForUpdate();
+    })();
+
+    // Reverifica a cada 6 horas enquanto o app estiver aberto. Aqui NÃO se instala: só
+    // acende o botão, porque reiniciar no meio do expediente perde pedido.
     const interval = setInterval(() => checkForUpdate(), 6 * 60 * 60 * 1000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [checkForUpdate]);
 
   // A confirmação "já está atualizado" é passageira: some sozinha para não virar ruído
@@ -737,6 +795,25 @@ function App() {
 
   const handleUpdateClick = async () => {
     if (!updateInfo) return;
+
+    // Com o updater nativo ligado, o botão INSTALA e reinicia — o lojista não precisa
+    // baixar nem passar pelo instalador do Windows. Aqui reiniciar é seguro: foi ele quem
+    // pediu, na hora que escolheu.
+    try {
+      const { shouldUpdate } = await checkUpdate();
+      if (shouldUpdate) {
+        setUpdateCheck({ state: 'installing' });
+        await writeDeviceStateFile();
+        await installUpdate();
+        await relaunch();
+        return;
+      }
+    } catch (err) {
+      console.warn('Instalacao automatica indisponivel, abrindo o download:', err);
+    }
+
+    // Sem updater nativo (ou se ele falhar), o caminho é o de sempre: baixar o instalador.
+    setUpdateCheck({ state: 'idle' });
     try {
       await openExternal(updateInfo.url);
     } catch {
@@ -748,6 +825,8 @@ function App() {
   useEffect(() => {
     try {
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+      // Espelha na reserva: é o que devolve a impressora e o som depois de uma atualização.
+      void writeDeviceStateFile();
     } catch {
       /* ignora falha de storage */
     }
@@ -1684,7 +1763,7 @@ function App() {
             <button
               type="button"
               onClick={() => checkForUpdate(true)}
-              disabled={updateCheck.state === 'checking'}
+              disabled={updateCheck.state === 'checking' || updateCheck.state === 'installing'}
               title="Clique para verificar se há atualização do app"
               className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition disabled:cursor-wait ${
                 updateCheck.state === 'up-to-date'
@@ -1696,8 +1775,16 @@ function App() {
                       : 'border-gray-600 bg-gray-700/50 text-gray-300 hover:border-gray-500 hover:text-white'
               }`}
             >
-              <RefreshCw className={`h-3.5 w-3.5 ${updateCheck.state === 'checking' ? 'animate-spin' : ''}`} />
-              {updateCheck.state === 'checking'
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${
+                  updateCheck.state === 'checking' || updateCheck.state === 'installing' ? 'animate-spin' : ''
+                }`}
+              />
+              {/* "Instalando" precisa aparecer: o app vai REINICIAR sozinho em seguida, e
+                  uma janela que some sem explicação parece travamento. */}
+              {updateCheck.state === 'installing'
+                ? 'Instalando a atualização…'
+                : updateCheck.state === 'checking'
                 ? 'Verificando…'
                 : updateCheck.state === 'up-to-date'
                   ? `v${appVersion} · atualizado`
@@ -2263,10 +2350,6 @@ function OrderDetails({
                     );
                   });
                 })()}
-                {/* PRODUTO POR PESO: onde a balança para, junto do produto. */}
-                {describeItemWeight(item) && (
-                  <p className="text-base font-bold text-amber-300">{describeItemWeight(item)}</p>
-                )}
                 {/* Observação do item em destaque: é instrução de produção, não detalhe. */}
                 {item.notes && (
                   <p className="text-base font-bold text-amber-300">&gt;&gt; OBS: {item.notes}</p>
@@ -2586,24 +2669,6 @@ interface ReceiptLine {
 // este rótulo no lugar do preço: "R$ 0.00" na comanda a cozinha lê como erro de sistema.
 const GIFT_RECEIPT_LABEL = '*** BRINDE ***';
 
-// ESPELHA describeWeightForReceipt/readItemWeight de src/lib/product-weight.ts no app web
-// (projetos separados, não há import entre eles). PRODUTO POR PESO: a linha diz onde a
-// balança para — no PESO, quando o cliente pediu em gramas; no VALOR, quando ele pediu em
-// reais (aí o peso é meta aproximada). Sem ela a comanda traz "1x Misturas por Quilo
-// R$ 15,00" e a cozinha não sabe quanta comida servir.
-function describeItemWeight(item: OrderItem): string | null {
-  const grams = Number(item.weight_grams);
-  if (!Number.isFinite(grams) || grams <= 0) return null;
-  const pesoTexto = grams >= 1000
-    ? `${String(grams / 1000).replace('.', ',')} kg`
-    : `${Math.round(grams)} g`;
-  if (item.weight_basis === 'amount') {
-    const valor = `R$ ${Number(item.subtotal || 0).toFixed(2).replace('.', ',')}`;
-    return `PESAR ATE ${valor} (~${pesoTexto})`;
-  }
-  return `PESO: ${pesoTexto}`;
-}
-
 // Retirada no balcão. ESPELHA isPickupOrder de src/lib/order-pickup.ts (projetos separados,
 // não há import entre eles): flag explícita gravada na criação e, para os pedidos antigos,
 // o rótulo no endereço (pedido manual) ou no início das observações (pedido da IA).
@@ -2725,9 +2790,6 @@ function buildReceiptDoc(order: Order, store: Store, config: PrintConfig): Recei
       push(itemLine);
       push(rightAlign(priceLine));
     }
-    // PRODUTO POR PESO: onde a balança para, em destaque e colado no produto.
-    const weightLine = describeItemWeight(item);
-    if (weightLine) pushStrong(`  ${weightLine}`);
     // Complementos pagos (borda, adicionais): a cozinha PRECISA vê-los.
     // Sabores de pizza ganham a fração correspondente (1/2, 1/3...).
     const flavorCount = countFlavors(item.complements);
@@ -2833,13 +2895,6 @@ function generateReceiptHtml(order: Order, store: Store): string {
     const sizeText = item.size_name ? ` (${item.size_name})` : '';
     const priceText = item.is_gift ? GIFT_RECEIPT_LABEL : `R$ ${item.subtotal.toFixed(2)}`;
     lines.push(`<div>${item.quantity}x ${escapeHtml(`${item.product_name}${sizeText}`)} - ${escapeHtml(priceText)}</div>`);
-    // PRODUTO POR PESO: onde a balança para.
-    const weightText = describeItemWeight(item);
-    if (weightText) {
-      lines.push(
-        `<div style="font-size: 14px; font-weight: bold; margin-left: 10px;">${escapeHtml(weightText)}</div>`,
-      );
-    }
     // Complementos pagos (borda, adicionais): a cozinha PRECISA vê-los.
     // Sabores de pizza ganham a fração correspondente (1/2, 1/3...).
     const flavorCount = countFlavors(item.complements);

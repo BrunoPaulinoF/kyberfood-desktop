@@ -33,7 +33,10 @@
       "http": {
         "all": true,
         "request": true,
-        "scope": ["http://**", "https://**"]
+        "scope": [
+          "http://**",
+          "https://**"
+        ]
       }
     },
     "bundle": {
@@ -74,6 +77,17 @@
       "iconPath": "icons/32x32.png",
       "iconAsTemplate": true,
       "menuOnLeftClick": false
+    },
+    "updater": {
+      "active": false,
+      "endpoints": [
+        "https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/latest.json"
+      ],
+      "dialog": false,
+      "pubkey": "",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }
