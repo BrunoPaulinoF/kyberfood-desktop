@@ -99,6 +99,37 @@ jobs:
           node -e "const fs=require('fs');const p='package.json';const j=JSON.parse(fs.readFileSync(p));j.version='$V';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
           node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p));j.package.version='$V';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
 
+      - name: Ligar o updater (só com chave de assinatura configurada)
+        # O updater do Tauri EXIGE a chave pública no tauri.conf.json e a privada no build:
+        # sem elas o app recusaria toda atualização por falta de assinatura.
+        #
+        # Por isso o repositório guarda o updater DESLIGADO e é aqui que ele liga, e só
+        # quando os dois secrets existem. Sem eles o build sai exatamente como saía antes —
+        # é o que mantém a publicação funcionando enquanto as chaves não estiverem prontas,
+        # em vez de quebrar o instalador de todas as lojas.
+        shell: bash
+        env:
+          TAURI_PUBLIC_KEY: ${{ secrets.TAURI_PUBLIC_KEY }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        run: |
+          set -e
+          if [ -z "$TAURI_PUBLIC_KEY" ] || [ -z "$TAURI_PRIVATE_KEY" ]; then
+            echo "::warning::Sem TAURI_PUBLIC_KEY/TAURI_PRIVATE_KEY: updater DESLIGADO neste build (a atualizacao continua manual)."
+            echo "updater=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const j = JSON.parse(fs.readFileSync(p));
+            j.tauri.updater.active = true;
+            j.tauri.updater.pubkey = process.env.TAURI_PUBLIC_KEY;
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+          "
+          echo "Updater ligado (assinatura configurada)."
+          echo "updater=true" >> "$GITHUB_OUTPUT"
+        id: updater
+
       - name: Gerar arquivo .env de produção
         # Opcional: se os Secrets estiverem configurados, sobrescrevem os valores
         # de produção embutidos no app (FALLBACK_* no App.tsx). Sem Secrets, ficam
@@ -115,6 +146,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: .
+        env:
+          # Assina os pacotes de atualização. Vazias (updater desligado), o Tauri
+          # simplesmente não gera os .sig e o build segue como sempre.
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
       - name: Renomear instaladores para nome fixo
         # O Tauri gera nomes com a versão embutida (KyberFood_1.0.0_x64-setup.exe).
@@ -128,22 +164,81 @@ jobs:
           cp "$msi" "KyberFood-Setup.msi"
           echo "Instaladores prontos: KyberFood-Setup.exe / KyberFood-Setup.msi"
 
+      - name: Preparar o pacote de atualização automática
+        # O updater do Tauri instala a partir de um .zip ASSINADO, não do instalador solto.
+        #
+        # É o pacote NSIS de propósito: o que as lojas têm instalado é o KyberFood-Setup.exe
+        # (NSIS). Atualizar por MSI em cima de uma instalação NSIS criaria uma SEGUNDA
+        # instalação em paralelo — duas versões do app na mesma máquina, uma delas invisível
+        # para quem só usa o atalho de sempre.
+        #
+        # Sem updater ligado o passo não acha nada e segue em silêncio: o build continua
+        # publicando o instalador manual, como sempre.
+        shell: bash
+        id: updater_bundle
+        run: |
+          set -e
+          # O nome vem do tauri-bundler e é "<App>_<versao>_x64-setup.exe.zip" (o zip do
+          # NSIS carrega o .exe dentro). Está documentado em updater/core.rs do tauri
+          # 1.8.3, em "Expected one of" — o updater identifica o tipo pelo arquivo DENTRO
+          # do zip (.exe = NSIS, .msi = MSI), não pelo nome de fora.
+          zip=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe.zip 2>/dev/null | head -n1 || true)
+          sig=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe.zip.sig 2>/dev/null | head -n1 || true)
+          if [ -z "$zip" ] || [ -z "$sig" ]; then
+            echo "Sem pacote de atualizacao (updater desligado neste build)."
+            echo "has_bundle=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cp "$zip" "KyberFood-Update.zip"
+          # A assinatura entra no manifesto como TEXTO, e é o que o app confere antes de
+          # instalar — sem ela conferindo, qualquer arquivo no lugar do nosso seria aceito.
+          {
+            echo "signature<<SIGEOF"
+            cat "$sig"
+            echo ""
+            echo "SIGEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "has_bundle=true" >> "$GITHUB_OUTPUT"
+          echo "Pacote de atualizacao pronto: KyberFood-Update.zip"
+
       - name: Gerar manifesto latest.json
-        # O app desktop consulta este arquivo para saber se há uma versão mais
-        # nova e oferecer (sem obrigar) a atualização ao usuário.
+        # Um arquivo, DOIS leitores — e é isso que mantém a frota inteira funcionando
+        # durante a virada:
+        #   - `version` / `pub_date` / `notes` / `url_win`: o formato de sempre, lido pelas
+        #     versões JÁ INSTALADAS (que só sabem avisar e abrir o download) e pela rota
+        #     /api/desktop/latest-version do painel;
+        #   - `platforms`: o formato do updater do Tauri, lido pelas versões novas, que
+        #     instalam sozinhas.
+        # O Tauri ignora os campos extras, então os dois convivem. Trocar um pelo outro
+        # deixaria metade das lojas sem saber que existe versão nova.
         shell: bash
         run: |
           set -e
           V="${{ steps.version.outputs.version }}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          cat > latest.json <<EOF
-          {
-            "version": "$V",
-            "pub_date": "$PUB_DATE",
-            "notes": "Nova versão do KyberFood Desktop disponível.",
-            "url_win": "https://github.com/${{ github.repository }}/releases/latest/download/KyberFood-Setup.exe"
-          }
-          EOF
+          REPO="${{ github.repository }}"
+          HAS_BUNDLE="${{ steps.updater_bundle.outputs.has_bundle }}"
+          SIGNATURE="${{ steps.updater_bundle.outputs.signature }}"
+
+          V="$V" PUB_DATE="$PUB_DATE" REPO="$REPO" HAS_BUNDLE="$HAS_BUNDLE" SIGNATURE="$SIGNATURE" node -e "
+            const fs = require('fs');
+            const base = 'https://github.com/' + process.env.REPO + '/releases/latest/download';
+            const manifest = {
+              version: process.env.V,
+              pub_date: process.env.PUB_DATE,
+              notes: 'Nova versão do KyberFood Desktop disponível.',
+              url_win: base + '/KyberFood-Setup.exe',
+            };
+            if (process.env.HAS_BUNDLE === 'true' && process.env.SIGNATURE) {
+              manifest.platforms = {
+                'windows-x86_64': {
+                  signature: process.env.SIGNATURE.trim(),
+                  url: base + '/KyberFood-Update.zip',
+                },
+              };
+            }
+            fs.writeFileSync('latest.json', JSON.stringify(manifest, null, 2) + '\n');
+          "
           cat latest.json
 
       - name: Publicar Release "desktop-latest" (link de download estável)
@@ -158,7 +253,11 @@ jobs:
             Versão: ${{ steps.version.outputs.version }}
             Baixe o KyberFood-Setup.exe abaixo.
           make_latest: true
+          # KyberFood-Update.zip só existe quando o updater está ligado; a action
+          # não falha por arquivo ausente (fail_on_unmatched_files é false por padrão),
+          # então a mesma lista serve aos dois casos.
           files: |
             KyberFood-Setup.exe
             KyberFood-Setup.msi
+            KyberFood-Update.zip
             latest.json
