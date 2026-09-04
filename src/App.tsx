@@ -1735,7 +1735,11 @@ function App() {
     clearCredentials();
     setReconnecting(false);
     try {
-      await supabase.auth.signOut();
+      // ESCOPO LOCAL, NUNCA O PADRÃO (o mesmo cuidado do painel, em `useAuth.tsx`).
+      // `signOut()` sem opções usa `scope: 'global'` e revoga TODAS as sessões da conta:
+      // sair aqui derrubaria o painel do lojista no navegador e os outros PCs da loja.
+      // Sair deste app é sair DESTE computador — a credencial salva já foi apagada acima.
+      await supabase.auth.signOut({ scope: 'local' });
     } catch (err) {
       console.warn('Falha ao sair da conta:', err);
     }
