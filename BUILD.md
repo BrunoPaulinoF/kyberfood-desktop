@@ -62,3 +62,14 @@ Toda vez que você rodar o workflow (ou publicar uma tag `desktop-v*`), a Releas
 baixar a versão nova sem nenhuma alteração no painel. Instalar por cima da versão antiga
 funciona. Esta versão passa a enviar o token de sessão nas chamadas à API — a versão
 anterior recebia 401 ao listar/atualizar pedidos.
+
+## Logo do app
+
+A logo é gerada do arquivo-fonte `src-tauri/icons/icon.svg`. Depois de editá-lo, rode
+**no monorepo** `npm run desktop:icons` para regravar os PNG, o `icon.ico` e o
+`public/icon.png` — o build não faz isso sozinho, e sem rodar o instalador sai com a logo
+antiga. O `npm test` do monorepo reprova se o SVG mudar e os ícones não forem regerados.
+
+O instalador NSIS usa o template `src-tauri/installer.nsi` (cópia do template do Tauri com a
+caixa "criar atalho na área de trabalho" **desmarcada**). Ao subir a versão do Tauri, recopie
+o template da tag nova e refaça as mudanças marcadas com `[KYBERFOOD]`.
