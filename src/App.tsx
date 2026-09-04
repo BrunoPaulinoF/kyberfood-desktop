@@ -481,19 +481,154 @@ function orderDisplayNumber(order: { order_number?: string | null; id: string })
 }
 
 /**
- * Janela em que um pedido confirmado é considerado "acabou de acontecer" e por isso NÃO
- * entra na linha de base como já impresso. 5 minutos cobrem com folga o pior caso do
- * watchdog (120s de silêncio até o reload + o tempo de a página voltar e sincronizar).
+ * FILA DA COMANDA — o pedido que não imprimiu tem que sair quando o computador voltar.
+ *
+ * O INCIDENTE (Fogão a Lenha, 04/09/2026): caiu a energia três vezes e as comandas desses
+ * momentos nunca saíram. O app JÁ retentava a impressão a cada 10s, mas só ENQUANTO
+ * LIGADO: a lista de "o que já imprimi" vivia em `useRef`, ou seja, em RAM. Desligou, a
+ * lista sumiu — e ao abrir, a linha de base marcava como já impresso tudo o que
+ * encontrasse em aberto, exceto o confirmado nos últimos 5 minutos. Esses 5 minutos foram
+ * dimensionados para o watchdog do webview (120s até o reload), NUNCA para queda de
+ * energia, que dura muito mais. Resultado: energia voltando depois de 5 minutos, o pedido
+ * nascia "já impresso" e a comanda não saía — em silêncio, sem aviso para ninguém.
+ *
+ * A CORREÇÃO É A LISTA SOBREVIVER AO DESLIGAMENTO. Ela passa a ser gravada em disco
+ * (localStorage), e a linha de base deixa de afirmar "já imprimiu" sobre o que ela nunca
+ * viu imprimir: ao voltar, o app compara o que o servidor tem em aberto com o que ELE
+ * imprimiu, e manda para a impressora a diferença.
+ *
+ * A FILA É DESTE COMPUTADOR, e não da loja. Numa loja com dois PCs, cada um precisa
+ * imprimir a SUA comanda — foi por isso que as vias extras pelo servidor foram revertidas
+ * (`20260903234500_drop_order_extra_receipts.sql`). Por isso o carimbo que o servidor
+ * guarda (`orders.receipt_printed_at`) serve ao painel e ao diagnóstico, e NUNCA veta a
+ * impressão aqui: a máquina que perdesse a corrida ficaria sem papel nenhum, e "a comanda
+ * some numa das duas máquinas" é bem pior de diagnosticar do que sair repetida.
+ *
+ * Espelha `src/lib/order-receipt-queue.ts` do web (projetos separados, sem import entre
+ * eles); a varredura que amarra os dois lados está em `desktop-order-intake.test.ts`.
  */
-const BASELINE_RECENT_CONFIRM_MS = 5 * 60 * 1000;
+const PRINTED_ORDERS_STORAGE_KEY = 'kyberfood.desktop.printedOrders';
+const RECEIPT_QUEUE_SINCE_STORAGE_KEY = 'kyberfood.desktop.receiptQueueSince';
 
-function isRecentlyConfirmed(order: Order): boolean {
-  // `updated_at` é o instante da confirmação (no PIX, quando o pagamento caiu); o
-  // `created_at` cobre a linha antiga que não traga a coluna. Data ilegível volta como
-  // "não é recente" — na dúvida, mantém o comportamento de sempre.
+/**
+ * Até quando um pedido pendente ainda merece papel.
+ *
+ * Seis horas cobrem qualquer queda dentro do MESMO expediente, que é o caso em que a
+ * comanda ainda tem uso. Acima disso o pedido já foi resolvido de outro jeito, e cuspir a
+ * comanda do almoço às 20h põe na bancada um pedido fantasma. O que fica de fora não é
+ * engolido: vira aviso (`notifyStaleReceipt`).
+ */
+const RECEIPT_QUEUE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+/** Por quanto tempo a lista gravada em disco é mantida — depois disso nada mais imprime mesmo. */
+const PRINTED_ORDERS_TTL_MS = 24 * 60 * 60 * 1000;
+
+function printedOrdersKey(storeId: string): string {
+  // Por LOJA: o app pode ser reapontado para outra loja, e a lista de uma não diz nada
+  // sobre a outra.
+  return `${PRINTED_ORDERS_STORAGE_KEY}.${storeId}`;
+}
+
+/** Pedidos já impressos NESTA máquina: id -> quando saiu. Poda o que passou do TTL. */
+function loadPrintedOrders(storeId: string): Map<string, number> {
+  const printed = new Map<string, number>();
+  try {
+    const raw = localStorage.getItem(printedOrdersKey(storeId));
+    if (!raw) return printed;
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    const cutoff = Date.now() - PRINTED_ORDERS_TTL_MS;
+    Object.entries(parsed || {}).forEach(([id, at]) => {
+      if (typeof at === 'number' && at > cutoff) printed.set(id, at);
+    });
+  } catch {
+    // Disco ilegível: o app volta ao comportamento de quem nunca imprimiu nada — e é o
+    // `queueSince` (também perdido, logo redefinido para agora) que impede isso de virar
+    // uma bobina inteira de histórico.
+  }
+  return printed;
+}
+
+function savePrintedOrders(storeId: string, printed: Map<string, number>) {
+  try {
+    const cutoff = Date.now() - PRINTED_ORDERS_TTL_MS;
+    const obj: Record<string, number> = {};
+    printed.forEach((at, id) => { if (at > cutoff) obj[id] = at; });
+    localStorage.setItem(printedOrdersKey(storeId), JSON.stringify(obj));
+  } catch {
+    // Sem disco a fila degrada para o que era antes (memória): a impressão continua
+    // funcionando, só não sobrevive ao desligamento.
+  }
+}
+
+/**
+ * Desde quando ESTA instalação mantém fila.
+ *
+ * Na primeira execução da versão com fila — e depois de uma reinstalação, que leva a lista
+ * junto — não há como saber o que já foi impresso antes. Sem este corte, o app cuspiria de
+ * uma vez todas as comandas em aberto no instante da atualização.
+ */
+function resolveReceiptQueueSince(storeId: string): number {
+  const key = `${RECEIPT_QUEUE_SINCE_STORAGE_KEY}.${storeId}`;
+  try {
+    const saved = Number(localStorage.getItem(key));
+    if (Number.isFinite(saved) && saved > 0) return saved;
+    const now = Date.now();
+    localStorage.setItem(key, String(now));
+    return now;
+  } catch {
+    return Date.now();
+  }
+}
+
+/**
+ * O instante que conta para a idade do pedido: a CONFIRMAÇÃO (no PIX, quando o pagamento
+ * caiu), que é o momento em que a comanda passou a ser devida.
+ */
+function receiptReferenceTime(order: Order): number | null {
   const stamp = Date.parse(order.updated_at || order.created_at);
-  if (!Number.isFinite(stamp)) return false;
-  return Date.now() - stamp < BASELINE_RECENT_CONFIRM_MS;
+  return Number.isFinite(stamp) ? stamp : null;
+}
+
+type ReceiptQueueVerdict = 'print' | 'already_printed' | 'not_printable' | 'before_queue' | 'too_old';
+
+function classifyReceiptPrint(
+  order: Order,
+  opts: { printedLocally: boolean; queueSince: number; now: number },
+): ReceiptQueueVerdict {
+  if (!['confirmed', 'preparing', 'delivering'].includes(order.status)) return 'not_printable';
+  if (opts.printedLocally) return 'already_printed';
+
+  const reference = receiptReferenceTime(order);
+  // Sem data legível não dá para saber se é o pedido de agora ou o da semana passada;
+  // tratar como antigo mantém o comportamento de sempre, e o oposto arriscaria despejar
+  // histórico na bobina por causa de um campo malformado.
+  if (reference === null) return 'before_queue';
+  if (reference < opts.queueSince) return 'before_queue';
+  if (opts.now - reference > RECEIPT_QUEUE_MAX_AGE_MS) return 'too_old';
+  return 'print';
+}
+
+/**
+ * Comanda que ficou pendente tempo demais NÃO sai calada.
+ *
+ * Papel do almoço saindo à noite vira pedido fantasma na bancada, então ela não é impressa
+ * — mas era exatamente esse silêncio que fazia o lojista descobrir o problema pelo cliente
+ * cobrando a entrega. Uma notificação por pedido, como a de falha de impressão.
+ */
+const staleReceiptNotifiedIds = new Set<string>();
+function notifyStaleReceipt(order: Order) {
+  if (staleReceiptNotifiedIds.has(order.id)) return;
+  staleReceiptNotifiedIds.add(order.id);
+  try {
+    if (window.Notification && Notification.permission === 'granted') {
+      new Notification('Comanda antiga NÃO impressa', {
+        body: `Pedido ${orderDisplayNumber(order)} ficou horas sem imprimir. Confira no painel e reimprima se ainda for preciso.`,
+        icon: '/icon.png',
+      });
+    }
+  } catch {
+    /* o aviso é secundário: nunca pode derrubar o caminho da impressão */
+  }
 }
 
 /**
@@ -793,11 +928,22 @@ function App() {
    */
   const printedViasRef = useRef<Map<string, number>>(new Map());
   // Linha de base: na 1ª sincronização após o login NÃO alertamos os pedidos que
-  // já existiam; só os que chegarem depois disparam som/impressão.
+  // já existiam. Ela vale só para o SOM/notificação — a impressão é decidida pela fila
+  // gravada em disco, senão a comanda pendente de uma queda de energia nasceria "já
+  // impressa" e nunca sairia (ver o bloco da fila da comanda).
   const baselineDoneRef = useRef(false);
+  /**
+   * Contexto da fila de comandas: a loja e desde quando ESTA instalação a mantém.
+   *
+   * Vive num ref porque `processIncomingOrder` é memoizado com deps vazias (para o polling
+   * não recriar o callback a cada render) e mesmo assim precisa do valor atual.
+   */
+  const receiptQueueRef = useRef<{ storeId: string; since: number }>({ storeId: '', since: Date.now() });
   // Ref sempre apontando para o printOrder mais recente, para o polling (memoizado)
   // imprimir sem capturar um closure antigo.
   const printOrderRef = useRef<(order: Order) => Promise<boolean>>(async () => false);
+  // Mesmo motivo: avisar o servidor de que a comanda saiu, a partir do callback memoizado.
+  const markReceiptPrintedRef = useRef<(orderId: string) => Promise<void>>(async () => {});
   const [showSettings, setShowSettings] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1037,8 +1183,6 @@ function App() {
     // polling ou o realtime reprocessam e a comanda sai (com som) no momento certo.
     if (isAwaitingOnlinePixPayment(order)) return;
 
-    const isConfirmedOrBeyond = ['confirmed', 'preparing', 'delivering'].includes(order.status);
-
     // ALERTA: som + notificação uma vez por pedido, no primeiro avistamento
     // (inclusive em 'ai_attention', para o balcão saber que chegou pedido a aprovar).
     const firstSighting = !seenOrderIdsRef.current.has(order.id);
@@ -1066,9 +1210,20 @@ function App() {
     // impresso, o polling nunca tentava de novo, e o único aviso era um texto numa
     // janela que vive escondida na bandeja. Falhando, o pedido volta à fila e a próxima
     // passada do polling (10s) tenta outra vez.
-    const canPrint = isConfirmedOrBeyond
+    //
+    // QUEM DECIDE É A FILA, não a linha de base: o pedido que ficou sem comanda numa queda
+    // de energia continua pendente depois do desligamento, porque a lista de impressos é
+    // gravada em disco. `too_old` é o único caso em que a comanda pendente não sai — e
+    // mesmo esse avisa em vez de calar.
+    const verdict = classifyReceiptPrint(order, {
+      printedLocally: printedOrderIdsRef.current.has(order.id),
+      queueSince: receiptQueueRef.current.since,
+      now: Date.now(),
+    });
+    if (verdict === 'too_old') notifyStaleReceipt(order);
+
+    const canPrint = verdict === 'print'
       && settingsRef.current.autoPrint
-      && !printedOrderIdsRef.current.has(order.id)
       && !printingOrderIdsRef.current.has(order.id);
 
     if (firstSighting) {
@@ -1081,6 +1236,16 @@ function App() {
         .then((ok) => {
           if (!ok) return;
           printedOrderIdsRef.current.add(order.id);
+          // Em DISCO, e não só em memória: é o que faz a queda de energia deixar de
+          // reimprimir o que já saiu — e o que impede a fila de virar duplicata.
+          const { storeId } = receiptQueueRef.current;
+          if (storeId) {
+            const printed = loadPrintedOrders(storeId);
+            printed.set(order.id, Date.now());
+            savePrintedOrders(storeId, printed);
+          }
+          // Avisa o servidor que a comanda saiu (best-effort — ver markReceiptPrinted).
+          void markReceiptPrintedRef.current(order.id);
           setLastOrderInfo({ number: orderDisplayNumber(order), at: Date.now(), printed: true });
         })
         .finally(() => {
@@ -1128,35 +1293,28 @@ function App() {
       const active = [...queue, ...inProgress];
 
       if (!baselineDoneRef.current) {
-        // Linha de base: não re-alertar/reimprimir o que já existia ao abrir o app
-        // — EXCETO pedidos PIX online ainda aguardando pagamento (ficam de fora
-        // para tocar/imprimir normalmente quando o PIX cair). Pedidos ainda em
-        // 'ai_attention' entram só no dedup de ALERTA: quando forem confirmados
-        // depois de o app abrir, a comanda ainda deve sair — então NÃO os marcamos
-        // como impressos aqui (só os que já estão confirmados/em produção).
+        // LINHA DE BASE: vale só para o ALERTA (som + notificação). Abrir o app não pode
+        // tocar o alarme por cada pedido que já estava em aberto. Pedido PIX online ainda
+        // aguardando pagamento fica de fora, para alertar normalmente quando o PIX cair.
+        //
+        // ELA NÃO DECIDE MAIS IMPRESSÃO — era exatamente isso que engolia a comanda depois
+        // de uma queda de energia: ela afirmava "já imprimiu" sobre pedidos que nunca viu
+        // imprimir. Quem responde por papel agora é a fila gravada em disco, e por isso os
+        // pedidos são processados logo abaixo, na mesma passada: o que ficou pendente sai.
         active.forEach(o => {
           if (isAwaitingOnlinePixPayment(o)) return;
           seenOrderIdsRef.current.add(o.id);
-          // Pedido confirmado HÁ POUCO fica FORA da linha de base. A baseline afirma "já
-          // imprimiu" sobre pedidos que ela nunca viu imprimir; num app que recarrega
-          // sozinho (o watchdog nativo dá location.reload() após 120s de silêncio do
-          // webview) isso engole justamente o pedido que acabou de ser confirmado e
-          // ainda não saiu na impressora. Reimprimir uma comanda dos últimos minutos é
-          // um incômodo visível e raro; perdê-la é invisível e custa o pedido.
-          if (['confirmed', 'preparing', 'delivering'].includes(o.status) && !isRecentlyConfirmed(o)) {
-            printedOrderIdsRef.current.add(o.id);
-          }
         });
         baselineDoneRef.current = true;
-      } else {
-        // Reprocessa todos os ativos na ordem de chegada; o dedup interno (alerta
-        // e impressão separados) garante que cada ação ocorra 1x. Sem pré-filtro
-        // por "visto": um pedido que já alertou em 'ai_attention' precisa ser
-        // reavaliado para imprimir quando chegar em CONFIRMADO.
-        active
-          .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-          .forEach(o => processIncomingOrder(o));
       }
+
+      // Reprocessa todos os ativos na ordem de chegada; o dedup interno (alerta e
+      // impressão separados) garante que cada ação ocorra 1x. Sem pré-filtro por "visto":
+      // um pedido que já alertou em 'ai_attention' precisa ser reavaliado para imprimir
+      // quando chegar em CONFIRMADO.
+      active
+        .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+        .forEach(o => processIncomingOrder(o));
 
       setNewOrders(queue);
       setInProgressOrders(inProgress);
@@ -1175,7 +1333,11 @@ function App() {
     if (!isAuthenticated || !store) return;
     // Nova sessão/loja: zera a linha de base (não a reaproveita entre lojas).
     seenOrderIdsRef.current = new Set();
-    printedOrderIdsRef.current = new Set();
+    // A lista de impressos vem do DISCO, não vazia: é ela que sobrevive a uma queda de
+    // energia e faz o app saber, ao voltar, quais comandas ainda faltam sair — e quais já
+    // saíram, para não repetir.
+    printedOrderIdsRef.current = new Set(loadPrintedOrders(store.id).keys());
+    receiptQueueRef.current = { storeId: store.id, since: resolveReceiptQueueSince(store.id) };
     printedViasRef.current = new Map();
     baselineDoneRef.current = false;
     syncFromServer(store.id);
@@ -1535,9 +1697,36 @@ function App() {
     }
   };
 
+  /**
+   * Avisa o servidor de que a comanda deste pedido SAIU.
+   *
+   * BEST-EFFORT DE PROPÓSITO: quando isto roda, o papel já está na mão da cozinha. O
+   * carimbo serve ao painel (mostrar quais pedidos ficaram sem comanda) e ao próximo
+   * diagnóstico — no incidente do Fogão a Lenha não havia como dizer QUAIS comandas não
+   * saíram, porque o banco não guardava nada sobre isso. Falhar aqui (internet caída, que é
+   * justamente o cenário da queda de energia) não pode custar nada: a fila que decide a
+   * impressão é a lista gravada NESTE computador, não este registro.
+   *
+   * Pelo cliente NATIVO (httpJson), como o polling e o heartbeat: o fetch do webview morre
+   * no preflight CORS e o erro só apareceria no console.
+   */
+  const markReceiptPrinted = async (orderId: string): Promise<void> => {
+    if (!store) return;
+    try {
+      await httpJson(`${apiUrl}/api/desktop/receipt-printed?storeId=${store.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(await getAuthHeaders()) },
+        body: { order_id: orderId, device_id: getDeviceId() },
+      });
+    } catch (err) {
+      console.warn('Não consegui registrar a comanda impressa no servidor:', err);
+    }
+  };
+
   // Mantém o ref de impressão apontando para o printOrder atual, para o polling
   // (memoizado) imprimir sempre com as configurações/loja mais recentes.
   useEffect(() => { printOrderRef.current = printOrder; });
+  useEffect(() => { markReceiptPrintedRef.current = markReceiptPrinted; });
 
   // Aplica a mudança de status localmente (otimista), movendo o pedido entre as
   // listas na hora. O realtime confirma/reconcilia em seguida. Lê o estado atual
