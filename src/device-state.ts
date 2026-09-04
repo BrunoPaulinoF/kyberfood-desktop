@@ -22,8 +22,17 @@ import { invoke } from '@tauri-apps/api/tauri';
 
 export const SETTINGS_STORAGE_KEY = 'kyberfood.desktop.settings';
 export const CREDENTIALS_STORAGE_KEY = 'kyberfood.desktop.credentials';
+/**
+ * Credencial só para PREENCHER a tela de login — é outra coisa da de cima.
+ *
+ * `CREDENTIALS_STORAGE_KEY` faz o app religar SOZINHO; ela é apagada pelo botão Sair,
+ * senão "Sair" não sairia (o relogin automático reconectaria no segundo seguinte).
+ * Esta aqui não dispara nada: ela só deixa e-mail e senha já digitados na tela, para o
+ * lojista clicar em Entrar e pronto. Por isso ela SOBREVIVE ao Sair.
+ */
+export const LOGIN_PREFILL_STORAGE_KEY = 'kyberfood.desktop.lastLogin';
 
-type DeviceState = { settings?: unknown; credentials?: string };
+type DeviceState = { settings?: unknown; credentials?: string; loginPrefill?: string };
 
 /** Lê a reserva. Arquivo ausente NÃO é erro: é o primeiro uso do app. */
 async function readDeviceStateFile(): Promise<DeviceState | null> {
@@ -52,6 +61,7 @@ export async function writeDeviceStateFile(): Promise<void> {
   try {
     const settingsRaw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     const credentialsRaw = localStorage.getItem(CREDENTIALS_STORAGE_KEY);
+    const prefillRaw = localStorage.getItem(LOGIN_PREFILL_STORAGE_KEY);
     const state: DeviceState = {};
     if (settingsRaw) {
       try {
@@ -61,6 +71,7 @@ export async function writeDeviceStateFile(): Promise<void> {
       }
     }
     if (credentialsRaw) state.credentials = credentialsRaw;
+    if (prefillRaw) state.loginPrefill = prefillRaw;
     await invoke('write_device_state', { contents: JSON.stringify(state) });
   } catch (err) {
     console.warn('Nao consegui gravar a reserva de configuracoes:', err);
@@ -84,7 +95,8 @@ export async function restoreDeviceStateIfEmpty(): Promise<void> {
   try {
     const hasSettings = localStorage.getItem(SETTINGS_STORAGE_KEY) !== null;
     const hasCredentials = localStorage.getItem(CREDENTIALS_STORAGE_KEY) !== null;
-    if (hasSettings && hasCredentials) return;
+    const hasPrefill = localStorage.getItem(LOGIN_PREFILL_STORAGE_KEY) !== null;
+    if (hasSettings && hasCredentials && hasPrefill) return;
 
     const state = await readDeviceStateFile();
     if (!state) return;
@@ -96,6 +108,9 @@ export async function restoreDeviceStateIfEmpty(): Promise<void> {
     if (!hasCredentials && typeof state.credentials === 'string') {
       localStorage.setItem(CREDENTIALS_STORAGE_KEY, state.credentials);
       console.info('Sessao da loja restaurada apos atualizacao.');
+    }
+    if (!hasPrefill && typeof state.loginPrefill === 'string') {
+      localStorage.setItem(LOGIN_PREFILL_STORAGE_KEY, state.loginPrefill);
     }
   } catch (err) {
     console.warn('Nao consegui restaurar a reserva de configuracoes:', err);

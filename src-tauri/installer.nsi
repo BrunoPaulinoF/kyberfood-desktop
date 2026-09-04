@@ -736,6 +736,15 @@ Section Uninstall
   DeleteRegValue HKCU "${MANUPRODUCTKEY}" "Installer Language"
 
   ; Delete app data
+  ;
+  ; [KYBERFOOD] nota: estas duas pastas são o `localStorage` do WebView2
+  ; ($LOCALAPPDATA) e a antiga reserva de configurações ($APPDATA). Quando as duas
+  ; morriam juntas, reinstalar o app DESLOGAVA a loja — a reserva que existia para
+  ; sobreviver à reinstalação morava na pasta irmã que este mesmo `if` apagava.
+  ;
+  ; Por isso a reserva passou a viver em `%APPDATA%\KyberFood` (ver device_state_path
+  ; em src/main.rs). NÃO acrescente essa pasta aqui: a conta só sai pelo botão Sair
+  ; dentro do app. Trava: desktop-login-persistence.test.ts, no monorepo.
   ${If} $DeleteAppDataCheckboxState == 1
     SetShellVarContext current
     RmDir /r "$APPDATA\${BUNDLEID}"

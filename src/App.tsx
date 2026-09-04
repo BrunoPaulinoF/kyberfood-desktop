@@ -22,6 +22,7 @@ import { invoke } from '@tauri-apps/api/tauri';
 import {
   SETTINGS_STORAGE_KEY,
   CREDENTIALS_STORAGE_KEY,
+  LOGIN_PREFILL_STORAGE_KEY,
   writeDeviceStateFile,
 } from './device-state';
 import { getVersion } from '@tauri-apps/api/app';
@@ -756,6 +757,58 @@ function clearCredentials() {
     // A reserva TAMBÉM some: sem isto o botão Sair não desconectaria de verdade — a
     // restauração devolveria a credencial apagada no próximo arranque.
     void writeDeviceStateFile();
+  } catch {
+    /* ignora */
+  }
+}
+
+/**
+ * PREENCHIMENTO da tela de login — deliberadamente separado da credencial de cima.
+ *
+ * A de cima faz o app religar SOZINHO e por isso o botão Sair a apaga; se não apagasse,
+ * "Sair" não sairia — o relogin automático reconectaria no segundo seguinte. Esta aqui
+ * não dispara nada: ela só deixa o e-mail e a senha já digitados, para quem clicou em
+ * Sair (ou teve a sessão recusada) voltar clicando UMA vez em Entrar.
+ *
+ * Guardá-la não é exposição nova: é o mesmo conteúdo que a outra chave já guarda, no
+ * mesmo lugar (a pasta de perfil do usuário do Windows).
+ */
+function saveLoginPrefill(credentials: SavedCredentials) {
+  try {
+    const json = JSON.stringify(credentials);
+    localStorage.setItem(
+      LOGIN_PREFILL_STORAGE_KEY,
+      btoa(String.fromCharCode(...new TextEncoder().encode(json))),
+    );
+    void writeDeviceStateFile();
+  } catch {
+    /* sem storage a tela só abre vazia, como antes */
+  }
+}
+
+function loadLoginPrefill(): SavedCredentials | null {
+  try {
+    const raw = localStorage.getItem(LOGIN_PREFILL_STORAGE_KEY);
+    if (!raw) return null;
+    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (typeof parsed?.email === 'string' && typeof parsed?.password === 'string') return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A senha salva foi RECUSADA (o lojista trocou a senha da conta). O e-mail continua
+ * preenchido — ele não mudou —, mas a senha sai: deixá-la ali prometeria "é só clicar em
+ * Entrar" para uma senha que o servidor acabou de rejeitar.
+ */
+function forgetPrefillPassword() {
+  try {
+    const prefill = loadLoginPrefill();
+    if (!prefill) return;
+    saveLoginPrefill({ email: prefill.email, password: '' });
   } catch {
     /* ignora */
   }
@@ -1853,6 +1906,8 @@ function App() {
 
       if (rejected) {
         clearCredentials();
+        // A senha guardada não vale mais; o e-mail continua preenchido na tela.
+        forgetPrefillPassword();
         setReconnecting(false);
         setError('A senha salva não vale mais. Entre novamente para o app voltar a receber pedidos.');
         return;
@@ -1974,6 +2029,9 @@ function App() {
         // Credencial guardada no ato: a partir daqui este PC se reconecta sozinho a
         // qualquer perda de sessão, sem depender de alguém estar na frente da tela.
         saveCredentials({ email, password });
+        // E o preenchimento da tela, que sobrevive ao Sair: se um dia alguém sair, a
+        // volta é um clique em Entrar, não redigitar e-mail e senha no balcão.
+        saveLoginPrefill({ email, password });
         loggingOutRef.current = false;
         setStore(storeData);
         setIsAuthenticated(true);
@@ -2467,8 +2525,12 @@ function StatusPanel({
 
 // Login Screen Component
 function LoginScreen({ onLogin, error }: { onLogin: (email: string, password: string) => void; error: string | null }) {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  // Abre com o último login já digitado: quem saiu (ou perdeu a sessão) volta clicando
+  // UMA vez em Entrar. O inicializador é preguiçoso — ler o localStorage a cada render
+  // seria trabalho repetido e, pior, sobrescreveria o que o lojista estivesse digitando.
+  const [prefill] = useState(loadLoginPrefill);
+  const [email, setEmail] = useState(() => prefill?.email ?? '');
+  const [password, setPassword] = useState(() => prefill?.password ?? '');
 
   return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center">

@@ -538,52 +538,98 @@ struct RendererWatchdog {
     last_ping: std::sync::Mutex<std::time::Instant>,
 }
 
+/// Pasta da reserva. Ela é DELIBERADAMENTE o nome do produto, e NÃO o identificador do
+/// pacote (`com.kyberfood.desktop`) — ver `device_state_path`.
+const DEVICE_STATE_DIR: &str = "KyberFood";
+
 /// Estado do DISPOSITIVO guardado FORA do WebView (impressora, som, sessão).
 ///
-/// POR QUE EXISTE: as configurações do app viviam só no `localStorage`, que fica no
-/// diretório de dados do WebView2. A atualização automática roda um instalador, e a
-/// documentação do Tauri NÃO garante que esses dados sobrevivem — se não sobrevivessem, a
-/// loja acordaria sem impressora selecionada e deslogada, com o app atualizando sozinho.
-/// Ou seja, o risco só apareceria DEPOIS de a atualização já ter acontecido em todas as
-/// lojas.
+/// POR QUE EXISTE: as configurações do app e a credencial do relogin automático vivem no
+/// `localStorage`, que no Windows fica em `%LOCALAPPDATA%\<identificador do pacote>` — o
+/// Tauri FORÇA esse caminho para o WebView2 (`manager.rs`, "in Windows, we need to force a
+/// data_directory"). Reinstalar o app pode levar essa pasta junto, e aí a loja acorda
+/// deslogada, sem ninguém ter clicado em Sair.
 ///
-/// Este arquivo vive no diretório de CONFIGURAÇÃO do app, que o instalador não toca, e é a
-/// reserva: o `localStorage` continua sendo a fonte primária (nada mudou no caminho
-/// normal), e isto aqui só responde quando ele volta vazio.
+/// ONDE ELA MORA, E POR QUE ISSO É O PONTO INTEIRO DESTE ARQUIVO:
+/// o desinstalador do NSIS apaga, quando a caixa "excluir os dados do aplicativo" está
+/// marcada, EXATAMENTE duas pastas — `$APPDATA\<identificador>` e
+/// `$LOCALAPPDATA\<identificador>` (ver a Section Uninstall em `installer.nsi`). A versão
+/// anterior desta reserva usava `app_config_dir()`, que é `%APPDATA%\<identificador>`: ou
+/// seja, ela morava na pasta IRMÃ que o mesmo `if` apagava, e era destruída pelo mesmo
+/// clique que destruía o `localStorage`. A reserva existia e não protegia nada.
+///
+/// Por isso o caminho agora é `%APPDATA%\KyberFood` — fora das duas pastas que o
+/// desinstalador conhece. Trava de regressão: `desktop-login-persistence.test.ts` no
+/// monorepo, que confere os DOIS lados (este arquivo e o `installer.nsi`).
+///
+/// A CONTRAPARTIDA, explícita: marcar "excluir os dados do aplicativo" ao desinstalar não
+/// apaga mais a credencial. É a regra do produto — a conta só sai pelo botão Sair, que
+/// apaga esta reserva (`clearCredentials`). Quem quiser mesmo tirar a conta da máquina
+/// clica em Sair antes de desinstalar.
 ///
 /// O conteúdo é o mesmo que já estava no `localStorage` — inclusive as credenciais, no
-/// mesmo nível de proteção de antes (o app roda numa máquina da loja e precisa religar
-/// sozinho). Não é segredo novo exposto: é o mesmo segredo, num lugar que sobrevive.
-fn device_state_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let dir = app
-        .path_resolver()
-        .app_config_dir()
-        .ok_or_else(|| "diretorio de configuracao indisponivel".to_string())?;
+/// mesmo nível de proteção de antes (a pasta de perfil do usuário do Windows). Não é
+/// segredo novo exposto: é o mesmo segredo, num lugar que sobrevive.
+fn device_state_path() -> Result<std::path::PathBuf, String> {
+    let dir = tauri::api::path::config_dir()
+        .ok_or_else(|| "diretorio de configuracao indisponivel".to_string())?
+        .join(DEVICE_STATE_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("device-state.json"))
 }
 
+/// Onde a reserva morava antes (dentro de `%APPDATA%\<identificador>`). Só é LIDA, para
+/// migrar quem já tem o arquivo lá; nada é gravado neste caminho.
+fn legacy_device_state_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path_resolver()
+        .app_config_dir()
+        .map(|dir| dir.join("device-state.json"))
+}
+
 /// Lê o estado guardado. Ausência de arquivo NÃO é erro: é o primeiro uso.
+///
+/// Sem achar no lugar novo, tenta o ANTIGO e o COPIA para o novo — senão quem já tinha
+/// reserva continuaria com ela na pasta que o desinstalador apaga, e a correção só valeria
+/// para quem fizesse login de novo.
 #[tauri::command]
 fn read_device_state(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let path = device_state_path(&app)?;
+    let path = device_state_path()?;
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(text)),
+        Ok(text) => return Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
+    let Some(legacy) = legacy_device_state_path(&app) else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&legacy) {
+        Ok(text) => {
+            // Migração best-effort: falhar aqui não pode esconder a reserva que ACABOU de
+            // ser lida — ela ainda serve para este arranque.
+            let _ = write_device_state_file(&text);
+            Ok(Some(text))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.to_string()),
     }
 }
 
-/// Grava o estado. A escrita é ATÔMICA (arquivo temporário + rename): uma queda de energia
-/// no meio da gravação deixaria um JSON pela metade, e aí a reserva estaria corrompida
-/// justamente no dia em que ela precisa funcionar.
-#[tauri::command]
-fn write_device_state(app: tauri::AppHandle, contents: String) -> Result<(), String> {
-    let path = device_state_path(&app)?;
+/// Escrita ATÔMICA (arquivo temporário + rename): uma queda de energia no meio da gravação
+/// deixaria um JSON pela metade, e aí a reserva estaria corrompida justamente no dia em que
+/// ela precisa funcionar.
+fn write_device_state_file(contents: &str) -> Result<(), String> {
+    let path = device_state_path()?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, contents.as_bytes()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Grava o estado.
+#[tauri::command]
+fn write_device_state(contents: String) -> Result<(), String> {
+    write_device_state_file(&contents)
 }
 
 /// Sinal de vida da interface. Só carimba a hora — barato o bastante para rodar a cada 15s.
