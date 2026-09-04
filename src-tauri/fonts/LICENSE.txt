@@ -1,0 +1,3 @@
+Liberation Sans (Regular e Bold) — Copyright (c) 2012 Red Hat, Inc., with Reserved Font Name Liberation.
+Licenciada sob a SIL Open Font License, Version 1.1 (https://scripts.sil.org/OFL).
+Embutida no app desktop para desenhar a comanda em modo gráfico (src/receipt_raster.rs).

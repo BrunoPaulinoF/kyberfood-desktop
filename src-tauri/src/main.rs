@@ -1,6 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod receipt_raster;
+
 use printpdf::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -454,6 +456,51 @@ fn print_receipt(
     }
 }
 
+/// Imprime a comanda em MODO GRÁFICO: o documento estruturado (JSON de blocos, ver
+/// `receipt_raster.rs`) é desenhado como imagem com a fonte embutida e enviado como bitmap
+/// raster ESC/POS. É o que troca a fonte estreita da impressora por uma letra legível.
+///
+/// `fallback_content` é a MESMA comanda em texto (o formato do modo de sempre): se o
+/// spooler recusar o RAW gráfico, a comanda sai pelo caminho de texto — perder a fonte
+/// bonita é degradação; perder a comanda é a cozinha sem o pedido.
+#[tauri::command]
+fn print_receipt_graphic(
+    printer_name: Option<String>,
+    layout: String,
+    fallback_content: String,
+    width: Option<i32>,
+    font_size: Option<f64>,
+) -> Result<(), String> {
+    let printer = match printer_name {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return Err("Nenhuma impressora configurada".to_string()),
+    };
+    let receipt_width_chars = width.unwrap_or(48);
+    let font_pt: f64 = font_size.unwrap_or(9.0);
+
+    #[cfg(target_os = "windows")]
+    {
+        let graphic_err = match receipt_raster::build_escpos_graphic(&layout, receipt_width_chars, font_pt) {
+            Ok(bytes) => match send_raw_to_printer(&printer, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        // Degrada para o modo texto (RAW de texto e, falhando também, PDF).
+        return print_receipt(Some(printer), fallback_content, Some(receipt_width_chars), Some(font_pt))
+            .map_err(|text_err| format!("Grafico: {} | {}", graphic_err, text_err));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No desenvolvimento (macOS/Linux) não há spooler RAW: valida o layout e cai no PDF
+        // de texto, como o modo de sempre.
+        receipt_raster::build_escpos_graphic(&layout, receipt_width_chars, font_pt)?;
+        print_receipt(Some(printer), fallback_content, Some(receipt_width_chars), Some(font_pt))
+    }
+}
+
 /// Test printer connection — usa o MESMO caminho da impressão real (RAW primeiro),
 /// para o teste refletir de fato o que acontece ao imprimir uma comanda.
 #[tauri::command]
@@ -631,6 +678,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_printers,
             print_receipt,
+            print_receipt_graphic,
             test_printer,
             renderer_alive,
             read_device_state,

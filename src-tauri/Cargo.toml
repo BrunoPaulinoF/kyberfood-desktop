@@ -18,6 +18,8 @@ serde_json = "1.0"
 printpdf = "0.5"
 tauri-plugin-autostart = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
 lopdf = "0.31"
+# Rasteriza a comanda em MODO GRÁFICO com uma fonte TTF (src/receipt_raster.rs). Puro Rust.
+ab_glyph = "0.2"
 
 [features]
 default = ["custom-protocol"]

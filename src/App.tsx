@@ -173,9 +173,17 @@ function compareVersions(a: string, b: string): number {
 // Espelha src/lib/desktop-print-config.ts do app web. O lojista edita na página
 // de Integrações (com pré-visualização) e o desktop aplica na comanda.
 type PrintFontSize = 'small' | 'normal' | 'large';
+/**
+ * COMO a comanda é desenhada: `printer` = modo TEXTO (a fonte da própria impressora, o de
+ * sempre); `graphic` = modo GRÁFICO (o app desenha a comanda como imagem com uma fonte de
+ * verdade e manda como bitmap raster ESC/POS — ver src-tauri/src/receipt_raster.rs).
+ * ESPELHA PrintFontStyle de src/lib/desktop-print-config.ts.
+ */
+type PrintFontStyle = 'printer' | 'graphic';
 
 interface PrintConfig {
   fontSize: PrintFontSize;
+  fontStyle: PrintFontStyle;
   paperWidth: 32 | 48; // 32 = 58mm, 48 = 80mm
   /**
    * Vias da MESMA comanda em CADA pedido novo, escolhidas pelo lojista em Integrações.
@@ -197,6 +205,7 @@ interface PrintConfig {
 
 const DEFAULT_PRINT_CONFIG: PrintConfig = {
   fontSize: 'normal',
+  fontStyle: 'printer',
   // 80mm (48 colunas) é o padrão do mercado das impressoras térmicas.
   paperWidth: 48,
   copies: 1,
@@ -242,11 +251,14 @@ function normalizePrintCopies(value: any): number {
 function normalizePrintConfig(value: any): PrintConfig {
   const raw = value && typeof value === 'object' ? value : {};
   const fontSize: PrintFontSize = raw.fontSize === 'small' || raw.fontSize === 'large' ? raw.fontSize : 'normal';
+  // Só o valor EXPLÍCITO liga o modo gráfico: config antiga (sem o campo) fica no texto.
+  const fontStyle: PrintFontStyle = raw.fontStyle === 'graphic' ? 'graphic' : 'printer';
   // Padrão 80mm (48); só cai para 58mm quando a loja escolheu 32 explicitamente.
   const paperWidth: 32 | 48 = Number(raw.paperWidth) === 32 ? 32 : 48;
   const bool = (v: any, fallback: boolean) => (v === undefined ? fallback : Boolean(v));
   return {
     fontSize,
+    fontStyle,
     paperWidth,
     copies: normalizePrintCopies(raw.copies),
     showStoreAddress: bool(raw.showStoreAddress, true),
@@ -314,6 +326,51 @@ const PAYMENT_CODE_LABELS: Record<string, string> = {
   OTHER: 'Outro',
 };
 
+// Dinheiro na comanda com VÍRGULA nos centavos ("R$ 83,00"), como todo documento
+// brasileiro. ESPELHA formatReceiptMoney de src/lib/desktop-print-config.ts.
+function formatReceiptMoney(value: number): string {
+  const n = Number(value) || 0;
+  const abs = Math.abs(n).toFixed(2).replace('.', ',');
+  return `${n < 0 ? '-' : ''}R$ ${abs}`;
+}
+
+// Telefone no formato brasileiro ("(19) 97125-3411") no lugar do JID cru do WhatsApp.
+// ESPELHA formatReceiptPhone de src/lib/desktop-print-config.ts.
+function formatReceiptPhone(raw?: string | null): string {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  if (!/^[\d\s()+-]+$/.test(text)) return text;
+  let digits = text.replace(/\D/g, '');
+  if ((digits.length === 12 || digits.length === 13) && digits.startsWith('55')) digits = digits.slice(2);
+  if (digits.length === 11) return `(${digits.slice(0, 2)}) ${digits.slice(2, 7)}-${digits.slice(7)}`;
+  if (digits.length === 10) return `(${digits.slice(0, 2)}) ${digits.slice(2, 6)}-${digits.slice(6)}`;
+  return text;
+}
+
+// Nome do cliente sem o "~" que o WhatsApp põe na frente do contato não salvo.
+// ESPELHA receiptCustomerName de src/lib/desktop-print-config.ts.
+function receiptCustomerName(raw?: string | null): string {
+  const name = String(raw || '').replace(/^[\s~]+/, '').trim();
+  return name || 'Cliente';
+}
+
+// Tamanho do item como vai para a comanda: SÓ o que a cozinha usa. O parêntese descritivo
+// do cadastro ("Grande (35cm, 8 fatias)") cai — "não tem a necessidade de ter a quantidade
+// de fatias, o centímetro também não" (Disk Pizzaiolo, 04/09/2026) — e o "Único" que o PDV
+// anexa a todo produto sem variação some. O peso do produto por quilo passa intacto.
+// ESPELHA receiptSizeLabel de src/lib/desktop-print-config.ts.
+function receiptSizeLabel(raw?: string | null): string | null {
+  let size = String(raw || '').trim();
+  if (!size) return null;
+  if (/^[uú]nico$/i.test(size)) return null;
+  let previous = '';
+  while (previous !== size) {
+    previous = size;
+    size = size.replace(/\s*\([^()]*\)\s*$/, '').trim();
+  }
+  return size || null;
+}
+
 // Texto do pagamento do pedido: usa payment_types quando existir (dividido,
 // personalizado, troco); senão cai no payment_method cru (pedidos antigos).
 function formatOrderPayments(order: Order): string {
@@ -327,15 +384,15 @@ function formatOrderPayments(order: Order): string {
         const isCustom = (code === 'OTHER' || code === 'VALE') && complement;
         const name = isCustom ? complement : (PAYMENT_CODE_LABELS[code] || 'Outro');
         const complementText = !isCustom && complement && complement.toUpperCase() !== 'PIX' ? ` ${complement}` : '';
-        const amountText = showAmount ? ` R$ ${(Number(p.amount) || 0).toFixed(2)}` : '';
+        const amountText = showAmount ? ` ${formatReceiptMoney(Number(p.amount) || 0)}` : '';
         const changeFor = Number(p.change_for) || 0;
-        const changeText = changeFor > 0 ? ` (troco p/ R$ ${changeFor.toFixed(2)})` : '';
+        const changeText = changeFor > 0 ? ` (troco p/ ${formatReceiptMoney(changeFor)})` : '';
         return `${name}${complementText}${amountText}${changeText}`;
       })
       .join(' + ');
   }
   const orderChangeFor = Number(order.change_for) || 0;
-  const orderChangeText = orderChangeFor > 0 ? ` (troco p/ R$ ${orderChangeFor.toFixed(2)})` : '';
+  const orderChangeText = orderChangeFor > 0 ? ` (troco p/ ${formatReceiptMoney(orderChangeFor)})` : '';
   return `${(order.payment_method || '').toUpperCase()}${orderChangeText}`;
 }
 
@@ -1411,18 +1468,34 @@ function App() {
       // Generate plain text receipt for thermal printer (respeita a config do lojista)
       const cfg = printConfigRef.current;
       const receiptText = encodeReceiptText(buildReceiptDoc(order, store!, cfg)) + '\n\n\n';
+      // MODO GRÁFICO: o mesmo documento vai como blocos (JSON) e o Rust o desenha como
+      // imagem com a fonte embutida. O texto de sempre viaja junto como fallback — se o
+      // spooler recusar o raster, a comanda sai no modo texto em vez de não sair.
+      const receiptLayout = cfg.fontStyle === 'graphic'
+        ? encodeReceiptLayout(buildReceiptLayout(order, store!, cfg))
+        : null;
 
       // UMA CHAMADA POR VIA: o build_escpos do Rust corta o papel no fim de cada impressão, e
       // o texto repetido numa chamada só sairia como uma tira única para alguém rasgar no meio.
       for (let via = jaSairam + 1; via <= totalVias; via += 1) {
         try {
           // Invoke Rust print command
-          await invoke('print_receipt', {
-            printerName,
-            content: receiptText,
-            width: cfg.paperWidth,
-            fontSize: FONT_SIZE_PT[cfg.fontSize],
-          });
+          if (receiptLayout) {
+            await invoke('print_receipt_graphic', {
+              printerName,
+              layout: receiptLayout,
+              fallbackContent: receiptText,
+              width: cfg.paperWidth,
+              fontSize: FONT_SIZE_PT[cfg.fontSize],
+            });
+          } else {
+            await invoke('print_receipt', {
+              printerName,
+              content: receiptText,
+              width: cfg.paperWidth,
+              fontSize: FONT_SIZE_PT[cfg.fontSize],
+            });
+          }
         } catch (err) {
           if (via === 1) throw err;
           // Vias anteriores JÁ SAÍRAM: reimprimir a comanda inteira daria a mesma via duas
@@ -1547,7 +1620,10 @@ function App() {
   const loadStoreForUser = useCallback(async (userId: string): Promise<Store | null> => {
     const { data: storeData } = await supabase
       .from('stores')
-      .select('*')
+      // Colunas explicitas: a linha de stores carrega o certificado A1 do Sicoob + a senha
+      // dele e os tokens de PIX/PDV, e este app roda com a chave PUBLICA no PC da loja.
+      // Este componente so usa estes cinco campos (ver a interface Store, acima).
+      .select('id, name, address, phone, timezone')
       .eq('user_id', userId)
       .eq('is_active', true)
       .order('created_at', { ascending: true })
@@ -2401,7 +2477,7 @@ function OrderDetails({
           {order.items?.map((item, index) => (
             <div key={index} className="flex justify-between items-start">
               <div>
-                <p className="font-medium">{item.quantity}x {item.product_name}{item.size_name ? ` (${item.size_name})` : ''}</p>
+                <p className="font-medium">{item.quantity}x {item.product_name}{receiptSizeLabel(item.size_name) ? ` (${receiptSizeLabel(item.size_name)})` : ''}</p>
                 {/* Complementos pagos (borda, adicionais): a cozinha precisa vê-los.
                     Sabores de pizza ganham a fração correspondente (1/2, 1/3...). */}
                 {(() => {
@@ -2412,7 +2488,7 @@ function OrderDetails({
                     const compPrice = Number(comp?.price) || 0;
                     return (
                       <p key={compIndex} className="text-sm text-gray-300">
-                        + {flavorFractionPrefix(comp, flavorCount)}{compName}{compPrice > 0 ? ` (R$ ${compPrice.toFixed(2)})` : ''}
+                        {isFlavorComplement(comp) ? '- ' : '+ '}{flavorFractionPrefix(comp, flavorCount)}{compName}{!isFlavorComplement(comp) && compPrice > 0 ? ` (${formatReceiptMoney(compPrice)})` : ''}
                       </p>
                     );
                   });
@@ -2422,7 +2498,7 @@ function OrderDetails({
                   <p className="text-base font-bold text-amber-300">&gt;&gt; OBS: {item.notes}</p>
                 )}
               </div>
-              <p className="text-green-400">{item.is_gift ? 'BRINDE' : `R$ ${item.subtotal.toFixed(2)}`}</p>
+              <p className="text-green-400">{item.is_gift ? 'BRINDE' : formatReceiptMoney(item.subtotal)}</p>
             </div>
           ))}
         </div>
@@ -2439,15 +2515,15 @@ function OrderDetails({
         <div className="border-t border-gray-700 mt-4 pt-4 space-y-2">
           <div className="flex justify-between text-sm">
             <span className="text-gray-400">Subtotal</span>
-            <span>R$ {order.subtotal.toFixed(2)}</span>
+            <span>{formatReceiptMoney(order.subtotal)}</span>
           </div>
           <div className="flex justify-between text-sm">
             <span className="text-gray-400">Entrega</span>
-            <span>R$ {order.delivery_fee.toFixed(2)}</span>
+            <span>{formatReceiptMoney(order.delivery_fee)}</span>
           </div>
           <div className="flex justify-between font-bold text-lg">
             <span>Total</span>
-            <span className="text-green-400">R$ {order.total.toFixed(2)}</span>
+            <span className="text-green-400">{formatReceiptMoney(order.total)}</span>
           </div>
         </div>
       </div>
@@ -2802,16 +2878,26 @@ function wrapText(text: string, width: number, firstPrefix = '', contPrefix = fi
   return out;
 }
 
-// Monta a comanda linha a linha, marcando as que saem em DESTAQUE (negrito + altura dupla).
-// ESPELHA src/lib/desktop-print-config.ts (buildReceiptDoc) do app web, para que a
-// pré-visualização mostrada no painel seja fiel à impressão real.
-//
-// Duas decisões vêm do lojista da Q Sabor (22/08/2026): o TIPO do pedido sai EM CIMA em
-// destaque, e a OBSERVAÇÃO DO PEDIDO sai logo ABAIXO DOS ITENS (antes ficava no rodapé,
-// depois do pagamento, no mesmo corpo de letra de todo o resto).
-function buildReceiptDoc(order: Order, store: Store, config: PrintConfig): ReceiptLine[] {
-  const width = config.paperWidth;
-  const line = (char = '-') => char.repeat(width);
+// Um BLOCO do documento da comanda. O documento é montado uma vez (buildReceiptLayout) e
+// serve aos dois modos: o TEXTO o achata em linhas de largura fixa (layoutToLines) e o
+// GRÁFICO o manda ao Rust, que o desenha como imagem (src-tauri/src/receipt_raster.rs).
+// ESPELHA ReceiptBlock de src/lib/desktop-print-config.ts e Block do receipt_raster.rs.
+type ReceiptBlock =
+  // `wrap`: quebra em várias linhas no modo TEXTO. Só observação e endereço da loja; texto
+  // do CLIENTE (nome) fica numa linha só — quebrado, um nome forjado criaria uma linha
+  // "STATUS: PAGO" solta (trava anti-forja do web, sanitize-text.test.ts).
+  | { kind: 'text'; text: string; align?: 'left' | 'center' | 'right'; strong?: boolean; big?: boolean; indent?: number; wrap?: boolean }
+  | { kind: 'row'; left: string; right: string; strong?: boolean; indent?: number }
+  | { kind: 'rule'; double?: boolean }
+  | { kind: 'space' };
+
+const INDENT_TEXT = '  ';
+
+// Achata o documento em linhas de largura fixa — o formato do modo TEXTO, o mesmo que a
+// comanda sempre teve. O `space` NÃO vira linha em branco (cada linha é bobina gasta).
+// ESPELHA layoutToLines de src/lib/desktop-print-config.ts.
+function layoutToLines(blocks: ReceiptBlock[], width: number): ReceiptLine[] {
+  const rule = (char: string) => char.repeat(width);
   const center = (text: string) => {
     const t = text.slice(0, width);
     const spaces = Math.max(0, Math.floor((width - t.length) / 2));
@@ -2820,99 +2906,161 @@ function buildReceiptDoc(order: Order, store: Store, config: PrintConfig): Recei
   const rightAlign = (text: string) => ' '.repeat(Math.max(0, width - text.length)) + text;
 
   const lines: ReceiptLine[] = [];
-  const push = (text: string) => lines.push({ text });
-  const pushStrong = (text: string) => lines.push({ text, emphasis: true });
+  for (const block of blocks) {
+    switch (block.kind) {
+      case 'rule':
+        lines.push({ text: rule(block.double ? '=' : '-') });
+        break;
+      case 'space':
+        break;
+      case 'text': {
+        const emphasis = Boolean(block.strong || block.big);
+        const prefix = INDENT_TEXT.repeat(block.indent || 0);
+        const wrapped = block.wrap ? wrapText(block.text, width, prefix, prefix + '   ') : [prefix + block.text];
+        if (wrapped.length === 0) wrapped.push('');
+        for (const raw of wrapped) {
+          const text = block.align === 'center' ? center(raw.trim()) : block.align === 'right' ? rightAlign(raw.trim()) : raw;
+          lines.push(emphasis ? { text, emphasis: true } : { text });
+        }
+        break;
+      }
+      case 'row': {
+        const emphasis = Boolean(block.strong);
+        const prefix = INDENT_TEXT.repeat(block.indent || 0);
+        const left = prefix + block.left;
+        const right = block.right;
+        const mark = (text: string): ReceiptLine => (emphasis ? { text, emphasis: true } : { text });
+        if (left.length + right.length + 1 <= width) {
+          lines.push(mark(`${left}${' '.repeat(width - left.length - right.length)}${right}`));
+        } else {
+          wrapText(block.left, width, prefix, prefix + '   ').forEach((l) => lines.push(mark(l)));
+          lines.push(mark(rightAlign(right)));
+        }
+        break;
+      }
+    }
+  }
+  return lines;
+}
+
+// Monta o DOCUMENTO da comanda (blocos). ESPELHA buildReceiptLayout de
+// src/lib/desktop-print-config.ts do app web, para que a pré-visualização mostrada no
+// painel seja fiel à impressão real.
+//
+// O que sai e o que NÃO sai vem de duas rodadas com lojistas, foto da comanda em mãos:
+// Q Sabor (22/08/2026) — TIPO do pedido em cima e OBSERVAÇÃO logo abaixo dos itens;
+// Disk Pizzaiolo (04/09/2026) — cai a descrição do tamanho ("35cm, 8 fatias"), cai o
+// preço repetido no sabor, produto e sabor em MAIÚSCULAS, dinheiro com vírgula, telefone
+// formatado. Pagamento, troco, desconto e entrega ficaram como estavam.
+function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): ReceiptBlock[] {
+  const blocks: ReceiptBlock[] = [];
+  const text = (block: Omit<Extract<ReceiptBlock, { kind: 'text' }>, 'kind'>) => blocks.push({ kind: 'text', ...block });
+  const row = (block: Omit<Extract<ReceiptBlock, { kind: 'row' }>, 'kind'>) => blocks.push({ kind: 'row', ...block });
+  const rule = (double = false) => blocks.push({ kind: 'rule', double });
+  const space = () => blocks.push({ kind: 'space' });
 
   const pickup = isPickupOrder(order);
+  const money = formatReceiptMoney;
 
-  push(center(store.name.toUpperCase()));
-  if (config.showStoreAddress && store.address) push(center(store.address));
-  push(line('='));
+  text({ text: store.name.toUpperCase(), align: 'center', strong: true });
+  if (config.showStoreAddress && store.address) text({ text: store.address, align: 'center', wrap: true });
+  rule(true);
   // TIPO DO PEDIDO, EM CIMA E EM DESTAQUE. Antes a retirada só aparecia no MEIO da ficha,
   // no lugar do endereço, e a entrega não aparecia em lugar nenhum.
-  pushStrong(center(pickup ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL));
-  push(line('='));
-  push(`PEDIDO: #${orderDisplayNumber(order)}`);
-  if (config.showDateTime) push(formatOrderDateTime(order.created_at, store.timezone));
-  if (order.scheduled_at) push(`AGENDADO P/: ${formatOrderDateTime(order.scheduled_at, store.timezone)}`);
-  push(line());
-  push(`CLIENTE: ${order.customer_name}`);
-  if (config.showCustomerPhone && order.customer_phone) push(`FONE: ${order.customer_phone}`);
+  text({ text: pickup ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL, align: 'center', strong: true, big: true });
+  rule(true);
+  const orderLabel = `PEDIDO #${orderDisplayNumber(order)}`;
+  if (config.showDateTime) row({ left: orderLabel, right: formatOrderDateTime(order.created_at, store.timezone), strong: true });
+  else text({ text: orderLabel, strong: true });
+  if (order.scheduled_at) text({ text: `AGENDADO P/: ${formatOrderDateTime(order.scheduled_at, store.timezone)}`, strong: true });
+  rule();
+  text({ text: `CLIENTE: ${receiptCustomerName(order.customer_name)}` });
+  if (config.showCustomerPhone && order.customer_phone) text({ text: `FONE: ${formatReceiptPhone(order.customer_phone)}` });
   // Retirada não imprime endereço: o endereço de um pedido de retirada é o da PRÓPRIA LOJA
   // e a comanda saía como se houvesse entrega a fazer. Quem diz o tipo é o marcador do topo,
   // que ignora showDeliveryAddress de propósito — é o TIPO do pedido, não o endereço.
   if (!pickup) {
-    if (config.showDeliveryAddress && order.delivery_address) push(`END: ${order.delivery_address}`);
-    if (config.showDeliveryAddress && order.delivery_neighborhood) push(`BAIRRO: ${order.delivery_neighborhood}`);
+    if (config.showDeliveryAddress && order.delivery_address) text({ text: `END: ${order.delivery_address}` });
+    if (config.showDeliveryAddress && order.delivery_neighborhood) text({ text: `BAIRRO: ${order.delivery_neighborhood}` });
   }
-  push(line('-'));
-  push('ITENS:');
+  rule();
+  text({ text: 'ITENS:' });
 
-  order.items?.forEach(item => {
-    const itemLine = `${item.quantity}x ${item.product_name}${item.size_name ? ` (${item.size_name})` : ''}`;
-    const priceLine = item.is_gift ? GIFT_RECEIPT_LABEL : `R$ ${item.subtotal.toFixed(2)}`;
-    if (itemLine.length + priceLine.length + 1 <= width) {
-      push(`${itemLine}${' '.repeat(width - itemLine.length - priceLine.length)}${priceLine}`);
-    } else {
-      push(itemLine);
-      push(rightAlign(priceLine));
-    }
-    // Complementos pagos (borda, adicionais): a cozinha PRECISA vê-los.
-    // Sabores de pizza ganham a fração correspondente (1/2, 1/3...).
+  (order.items || []).forEach((item, index) => {
+    if (index > 0) space();
+    const size = receiptSizeLabel(item.size_name);
+    const itemLine = `${item.quantity}x ${String(item.product_name || '').toUpperCase()}${size ? ` (${size})` : ''}`;
+    // CORTESIA sai com o rótulo, nunca com "R$ 0,00".
+    row({ left: itemLine, right: item.is_gift ? GIFT_RECEIPT_LABEL : money(item.subtotal), strong: true });
+    // Sabor de pizza sai com a fração (1/2, 1/3...) e SEM preço — o valor já está no item.
+    // Adicional pago (borda, extra) mantém o valor.
     const flavorCount = countFlavors(item.complements);
     (item.complements || []).forEach((comp) => {
-      const compName = String(comp?.name || '').trim();
+      const compName = String(comp?.name || '').trim().toUpperCase();
       if (!compName) return;
       const compPrice = Number(comp?.price) || 0;
-      const label = `${flavorFractionPrefix(comp, flavorCount)}${compName}`;
-      push(compPrice > 0 ? `  + ${label} (R$ ${compPrice.toFixed(2)})` : `  + ${label}`);
+      if (isFlavorComplement(comp)) {
+        text({ text: `- ${flavorFractionPrefix(comp, flavorCount)}${compName}`, indent: 1 });
+      } else if (compPrice > 0) {
+        row({ left: `+ ${compName}`, right: money(compPrice), indent: 1 });
+      } else {
+        text({ text: `+ ${compName}`, indent: 1 });
+      }
     });
     // Observação do ITEM em destaque, colada no produto a que pertence.
-    if (config.showItemNotes && item.notes) {
-      wrapText(item.notes, width, ITEM_NOTE_RECEIPT_PREFIX, '     ').forEach(pushStrong);
-    }
+    if (config.showItemNotes && item.notes) text({ text: `${ITEM_NOTE_RECEIPT_PREFIX.trim()} ${item.notes}`, indent: 1, strong: true, wrap: true });
   });
 
-  // OBSERVAÇÃO DO PEDIDO logo abaixo dos ITENS (antes ficava no rodapé, depois do
-  // pagamento) e em destaque: é instrução de PRODUÇÃO, não detalhe de conferência.
+  // OBSERVAÇÃO DO PEDIDO logo abaixo dos ITENS e em destaque: é instrução de PRODUÇÃO.
   if (config.showOrderNotes && order.notes) {
-    push(line('-'));
-    pushStrong(ORDER_NOTES_RECEIPT_LABEL);
-    wrapText(order.notes, width).forEach(pushStrong);
+    rule();
+    text({ text: ORDER_NOTES_RECEIPT_LABEL, strong: true });
+    text({ text: String(order.notes), strong: true, wrap: true });
   }
 
-  push(line());
-  push(rightAlign(`Subtotal: R$ ${order.subtotal.toFixed(2)}`));
-  push(rightAlign(`Entrega: R$ ${order.delivery_fee.toFixed(2)}`));
+  rule();
+  row({ left: 'Subtotal', right: money(order.subtotal) });
+  row({ left: 'Entrega', right: money(order.delivery_fee) });
   if (order.discount_amount && order.discount_amount > 0) {
     const cupom = order.coupon_code ? ` (${order.coupon_code})` : '';
-    push(rightAlign(`Desconto${cupom}: -R$ ${order.discount_amount.toFixed(2)}`));
+    row({ left: `Desconto${cupom}`, right: money(-order.discount_amount) });
   }
   if (order.increase_amount && order.increase_amount > 0) {
-    push(rightAlign(`Acrescimo: +R$ ${order.increase_amount.toFixed(2)}`));
+    row({ left: 'Acrescimo', right: `+${money(order.increase_amount)}` });
   }
-  push(rightAlign(`TOTAL: R$ ${order.total.toFixed(2)}`));
-  push(line('='));
+  text({ text: `TOTAL: ${money(order.total)}`, align: 'right', strong: true, big: true });
+  rule(true);
 
   if (config.showPayment && (order.payment_method || order.metadata?.saipos?.payment_types?.length)) {
-    push(`PAGAMENTO: ${formatOrderPayments(order)}`);
-    push(`STATUS: ${order.payment_status === 'paid' ? 'PAGO' : 'PENDENTE'}`);
+    text({ text: `PAGAMENTO: ${formatOrderPayments(order)}`, strong: true, wrap: true });
+    text({ text: `STATUS: ${order.payment_status === 'paid' ? 'PAGO' : 'PENDENTE'}` });
   }
 
   if (config.footerText.trim()) {
-    push(line('='));
-    push(center(config.footerText));
+    rule(true);
+    text({ text: config.footerText.trim(), align: 'center' });
   }
 
-  // TRAVA ANTI-FORJA: nenhum campo do pedido pode criar uma LINHA NOVA na comanda.
-  // Um cliente que põe quebras de linha no próprio nome do WhatsApp forjava um
-  // "STATUS: PAGO" logo abaixo do "CLIENTE:" e a comanda saía idêntica à de um
-  // pedido pago. A troca é por espaço justamente para o alinhamento em colunas
-  // montado acima continuar válido.
-  //
-  // É TAMBÉM O QUE IMPEDE FORJAR DESTAQUE: a marca de destaque é aplicada DEPOIS desta
-  // limpeza (`encodeReceiptText`), então nada vindo do pedido emite uma linha em negrito.
-  return lines.map((l) => ({ ...l, text: stripControlChars(l.text) }));
+  // TRAVA ANTI-FORJA: nenhum campo do pedido cria LINHA NOVA nem destaque na comanda (a
+  // marca do modo texto é um caractere de controle aplicado DEPOIS desta limpeza, em
+  // encodeReceiptText).
+  return blocks.map((block) => {
+    if (block.kind === 'text') return { ...block, text: stripControlChars(block.text) };
+    if (block.kind === 'row') return { ...block, left: stripControlChars(block.left), right: stripControlChars(block.right) };
+    return block;
+  });
+}
+
+// Serializa o documento para o Rust desenhar no modo GRÁFICO (print_receipt_graphic).
+// ESPELHA encodeReceiptLayout do app web.
+function encodeReceiptLayout(blocks: ReceiptBlock[]): string {
+  return JSON.stringify({ blocks });
+}
+
+// A comanda linha a linha, no formato do modo TEXTO — derivada do documento de blocos.
+// ESPELHA buildReceiptDoc do app web.
+function buildReceiptDoc(order: Order, store: Store, config: PrintConfig): ReceiptLine[] {
+  return layoutToLines(buildReceiptLayout(order, store, config), config.paperWidth);
 }
 
 // Serializa a comanda para o comando de impressão: uma linha por linha, com as destacadas
@@ -2933,7 +3081,8 @@ function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
-// Generate Receipt HTML
+// Generate Receipt HTML — usado quando a impressão nativa falha. Mesmas regras de
+// conteúdo da comanda (tamanho limpo, sabor sem preço, dinheiro com vírgula).
 function generateReceiptHtml(order: Order, store: Store): string {
   const lines: string[] = [];
 
@@ -2945,11 +3094,11 @@ function generateReceiptHtml(order: Order, store: Store): string {
       `${escapeHtml(isPickupOrder(order) ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL)}</div>`,
   );
   lines.push('<hr>');
-  lines.push(`<div><strong>PEDIDO: #${escapeHtml(orderDisplayNumber(order))}</strong></div>`);
+  lines.push(`<div><strong>PEDIDO #${escapeHtml(orderDisplayNumber(order))}</strong></div>`);
   lines.push(`<div>${escapeHtml(formatOrderDateTime(order.created_at, store.timezone))}</div>`);
   lines.push('<hr>');
-  lines.push(`<div>CLIENTE: ${escapeHtml(order.customer_name)}</div>`);
-  lines.push(`<div>FONE: ${escapeHtml(order.customer_phone)}</div>`);
+  lines.push(`<div>CLIENTE: ${escapeHtml(receiptCustomerName(order.customer_name))}</div>`);
+  lines.push(`<div>FONE: ${escapeHtml(formatReceiptPhone(order.customer_phone))}</div>`);
   // Retirada não imprime endereço (é o da própria loja) — quem diz o tipo é o marcador
   // em destaque no TOPO, montado logo acima.
   if (!isPickupOrder(order)) {
@@ -2959,18 +3108,20 @@ function generateReceiptHtml(order: Order, store: Store): string {
   lines.push('<div><strong>ITENS:</strong></div>');
 
   order.items?.forEach(item => {
-    const sizeText = item.size_name ? ` (${item.size_name})` : '';
-    const priceText = item.is_gift ? GIFT_RECEIPT_LABEL : `R$ ${item.subtotal.toFixed(2)}`;
-    lines.push(`<div>${item.quantity}x ${escapeHtml(`${item.product_name}${sizeText}`)} - ${escapeHtml(priceText)}</div>`);
-    // Complementos pagos (borda, adicionais): a cozinha PRECISA vê-los.
-    // Sabores de pizza ganham a fração correspondente (1/2, 1/3...).
+    const size = receiptSizeLabel(item.size_name);
+    const sizeText = size ? ` (${size})` : '';
+    const priceText = item.is_gift ? GIFT_RECEIPT_LABEL : formatReceiptMoney(item.subtotal);
+    lines.push(`<div><strong>${item.quantity}x ${escapeHtml(`${String(item.product_name || '').toUpperCase()}${sizeText}`)}</strong> - ${escapeHtml(priceText)}</div>`);
+    // Sabor de pizza com a fração (1/2, 1/3...) e SEM preço; adicional pago com o valor.
     const flavorCount = countFlavors(item.complements);
     (item.complements || []).forEach((comp) => {
-      const compName = String(comp?.name || '').trim();
+      const compName = String(comp?.name || '').trim().toUpperCase();
       if (!compName) return;
       const compPrice = Number(comp?.price) || 0;
       const label = `${flavorFractionPrefix(comp, flavorCount)}${compName}`;
-      const compText = compPrice > 0 ? `+ ${label} (R$ ${compPrice.toFixed(2)})` : `+ ${label}`;
+      const compText = isFlavorComplement(comp)
+        ? `- ${label}`
+        : compPrice > 0 ? `+ ${label} (${formatReceiptMoney(compPrice)})` : `+ ${label}`;
       lines.push(`<div style="font-size: 10px; margin-left: 10px;">${escapeHtml(compText)}</div>`);
     });
     if (item.notes) {
@@ -2989,9 +3140,9 @@ function generateReceiptHtml(order: Order, store: Store): string {
   }
 
   lines.push('<hr>');
-  lines.push(`<div style="text-align: right;">Subtotal: R$ ${order.subtotal.toFixed(2)}</div>`);
-  lines.push(`<div style="text-align: right;">Entrega: R$ ${order.delivery_fee.toFixed(2)}</div>`);
-  lines.push(`<div style="text-align: right; font-weight: bold; font-size: 14px;">TOTAL: R$ ${order.total.toFixed(2)}</div>`);
+  lines.push(`<div style="text-align: right;">Subtotal: ${formatReceiptMoney(order.subtotal)}</div>`);
+  lines.push(`<div style="text-align: right;">Entrega: ${formatReceiptMoney(order.delivery_fee)}</div>`);
+  lines.push(`<div style="text-align: right; font-weight: bold; font-size: 14px;">TOTAL: ${formatReceiptMoney(order.total)}</div>`);
   lines.push('<hr>');
   lines.push(`<div>PAGAMENTO: ${escapeHtml(formatOrderPayments(order))} ${order.payment_status === 'paid' ? '✓' : ''}</div>`);
 
