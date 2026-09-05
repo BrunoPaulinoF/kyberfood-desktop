@@ -994,9 +994,16 @@ function App() {
   const receiptQueueRef = useRef<{ storeId: string; since: number }>({ storeId: '', since: Date.now() });
   // Ref sempre apontando para o printOrder mais recente, para o polling (memoizado)
   // imprimir sem capturar um closure antigo.
-  const printOrderRef = useRef<(order: Order) => Promise<boolean>>(async () => false);
+  const printOrderRef = useRef<(order: Order, options?: { copies?: number }) => Promise<boolean>>(async () => false);
   // Mesmo motivo: avisar o servidor de que a comanda saiu, a partir do callback memoizado.
   const markReceiptPrintedRef = useRef<(orderId: string) => Promise<void>>(async () => {});
+  /**
+   * Reimpressão pedida pelo painel, pelo MESMO caminho da comanda automática.
+   *
+   * `true` = saiu; `false` = a impressora falhou; `null` = não deu para montar a comanda
+   * (pedido não encontrado), e aí o chamador cai no texto que veio no job.
+   */
+  const reprintReceiptRef = useRef<((orderId: string) => Promise<boolean | null>) | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1567,7 +1574,7 @@ function App() {
         .update({ status: 'printing', claimed_at: new Date().toISOString(), device_id: getDeviceId() })
         .eq('id', jobId)
         .eq('status', 'pending')
-        .select('id, content, paper_width, font_size_pt');
+        .select('id, content, paper_width, font_size_pt, order_id');
       if (error) throw error;
       claimed = Array.isArray(data) ? data[0] : data;
     } catch (err) {
@@ -1582,6 +1589,47 @@ function App() {
       setPrintError('Nenhuma impressora configurada — abra Configurações');
       await finishPrintJob(jobId, 'failed', 'Nenhuma impressora configurada');
       return;
+    }
+
+    // REIMPRESSÃO DE COMANDA: monta pelo MESMO caminho da impressão automática.
+    //
+    // O job traz o TEXTO pronto, montado pelo site — e é justamente aí que a reimpressão
+    // saía diferente da comanda que a cozinha conhece: são dois montadores do mesmo
+    // documento, e o do app instalado quase sempre está numa versão anterior à do site (o
+    // instalador chega por auto-update, loja a loja). Some-se o modo GRÁFICO, que a comanda
+    // automática usa e o texto puro do job não.
+    //
+    // Com o pedido em mãos, `printOrder` é literalmente o mesmo código dos dois lados: a
+    // paridade passa a ser por construção, não por dois trechos que alguém precisa lembrar
+    // de manter iguais. Falhando a busca do pedido, cai no texto do job — perder o layout é
+    // degradação, não imprimir é o problema que o botão existe para resolver.
+    const reprintOrderId = String(claimed.order_id || '');
+    if (reprintReceiptRef.current && reprintOrderId) {
+      // O `try` do texto começa só mais abaixo, então uma REJEIÇÃO aqui escaparia de
+      // `runPrintJob` inteiro: o job ficaria preso em `printing` para sempre (o id já está
+      // em `printJobSeenRef`, então nem a varredura o retenta) e — pior — o painel leria
+      // isso como SUCESSO: aos 25s ele tenta cancelar, perde o CAS porque o status não é
+      // mais `pending`, e devolve `printed`. O lojista veria "enviado para a impressora"
+      // sem papel nenhum. Tratar como `null` faz cair no texto do job, que é o pior caso
+      // aceitável: papel divergente, mas papel.
+      let done: boolean | null = null;
+      try {
+        done = await reprintReceiptRef.current(reprintOrderId);
+      } catch (err) {
+        console.warn('Falha ao reimprimir pelo pedido; caindo para o texto do job:', err);
+        done = null;
+      }
+      if (done) {
+        setPrintError(null);
+        await finishPrintJob(jobId, 'printed', null);
+        return;
+      }
+      // `null` (pedido não encontrado/ilegível) segue para o texto abaixo; `false` é falha
+      // da impressora, e nesse caso repetir pelo outro caminho só gastaria papel.
+      if (done === false) {
+        await finishPrintJob(jobId, 'failed', `Falha ao imprimir na impressora "${printerName}"`);
+        return;
+      }
     }
 
     try {
@@ -1727,7 +1775,11 @@ function App() {
 
       // Todas as vias saíram: o contador não serve mais (quem lembra do pedido impresso é o
       // printedOrderIdsRef) e ficaria crescendo sem fim numa loja de movimento.
-      printedViasRef.current.delete(order.id);
+      //
+      // SÓ NO CAMINHO DA COMANDA, nunca no da reimpressão: apagar o contador a partir de uma
+      // via de cortesia jogaria fora o "a via 1 já saiu" de uma comanda automática que parou
+      // no meio, e a retentativa do polling mandaria a via 1 de novo para a cozinha.
+      if (!reimpressao) printedViasRef.current.delete(order.id);
       setPrintError(null);
       console.log('Order printed successfully');
       return true;
@@ -1776,10 +1828,107 @@ function App() {
     }
   };
 
+  /**
+   * Reimprime a comanda de um pedido a pedido do painel.
+   *
+   * O QUE ELA RESOLVE: a reimpressão saía do montador do SITE e a comanda automática, do
+   * montador do APP — dois códigos para o mesmo documento, e o do app quase sempre numa
+   * versão anterior (o instalador chega por auto-update, loja a loja). O papel saía
+   * diferente do que a cozinha conhece. Aqui é `printOrder`, o mesmo dos dois lados.
+   *
+   * UMA VIA, SEMPRE (`copies: 1`): quem aperta o botão quer uma folha na mão; a comanda do
+   * pedido já saiu no número de vias configurado.
+   *
+   * ENCERRA A PENDÊNCIA DA FILA quando dá certo, e isso não é detalhe: se a comanda
+   * automática tinha falhado (impressora sem papel, energia caindo), o pedido continua na
+   * fila e o polling tentaria de novo a cada 10s — a cozinha receberia uma SEGUNDA comanda
+   * do mesmo pedido logo depois da que o lojista acabou de reimprimir.
+   */
+  const reprintReceipt = async (orderId: string): Promise<boolean | null> => {
+    if (!store) return null;
+    let order: Order | null = null;
+    try {
+      const { data, error } = await supabase
+        .from('orders')
+        // Sem o join de produtos: a comanda usa `product_name` do item e nunca `item.product`
+        // (é o mesmo select dos outros dois fetches de pedido do app). Um embed a mais é uma
+        // chance a mais de o select inteiro falhar — e falhar aqui volta a imprimir o texto
+        // do site, que é justamente o papel divergente que esta função existe para evitar.
+        .select('*, items:order_items(*)')
+        .eq('id', orderId)
+        // A loja entra no filtro além da RLS: um id de outra loja não pode virar papel aqui.
+        .eq('store_id', store.id)
+        .maybeSingle();
+      if (error) throw error;
+      order = (data as Order) || null;
+    } catch (err) {
+      console.warn('Nao consegui carregar o pedido para reimprimir:', err);
+      return null;
+    }
+    if (!order) return null;
+
+    /**
+     * ESTA REIMPRESSÃO ESTÁ NO LUGAR DA COMANDA QUE FALTOU, ou é uma via de cortesia?
+     *
+     * A distinção decide TUDO o que vem abaixo, e ignorá-la produz os dois erros opostos:
+     *
+     * - Tratar tudo como cortesia (1 via, sem encerrar a pendência) faria a comanda
+     *   automática sair de novo 10s depois, pelo polling — a cozinha receberia a segunda
+     *   via logo após a que o lojista acabou de tirar.
+     * - Tratar tudo como substituta (encerrando a pendência) é PIOR: reimprimir um pedido
+     *   que ainda aguarda pagamento PIX — coisa que o lojista faz para conferir — marcaria
+     *   como impressa uma comanda que ainda nem era devida, e quando o pagamento caísse a
+     *   comanda de verdade NUNCA sairia, sem nada acusar (o carimbo do servidor também
+     *   apagaria o aviso "Comanda não impressa" do painel).
+     *
+     * Quem responde é o MESMO veredito da fila que a impressão automática usa, mais a
+     * mesma guarda de PIX de `processIncomingOrder`: duas leituras diferentes fariam a
+     * marcação e a impressão discordarem.
+     */
+    const pendente = !isAwaitingOnlinePixPayment(order)
+      && classifyReceiptPrint(order, {
+        printedLocally: printedOrderIdsRef.current.has(order.id),
+        queueSince: receiptQueueRef.current.since,
+        now: Date.now(),
+      }) === 'print';
+
+    // Uma comanda de cada vez, o MESMO conjunto que a impressão automática usa: sem isso,
+    // o clique do lojista e o tick do polling (10s) imprimem o mesmo pedido em paralelo —
+    // e é exatamente o que acontece quando a energia volta e ele não vê papel nenhum.
+    if (printingOrderIdsRef.current.has(order.id)) return true;
+    printingOrderIdsRef.current.add(order.id);
+    let ok = false;
+    try {
+      // SUBSTITUTA sai como a automática sairia: o número de vias que o lojista configurou,
+      // continuando de onde uma tentativa anterior parou. CORTESIA sai em UMA via — quem
+      // aperta o botão sobre um pedido já impresso quer uma folha na mão.
+      ok = pendente
+        ? await printOrderRef.current(order)
+        : await printOrderRef.current(order, { copies: 1 });
+    } finally {
+      printingOrderIdsRef.current.delete(order.id);
+    }
+    if (!ok) return false;
+    if (!pendente) return true;
+
+    // A comanda que faltava saiu: o pedido deixa de estar pendente NESTE computador, e o
+    // servidor registra que ele tem comanda (é o que apaga o aviso do painel).
+    printedOrderIdsRef.current.add(order.id);
+    const { storeId } = receiptQueueRef.current;
+    if (storeId) {
+      const printed = loadPrintedOrders(storeId);
+      printed.set(order.id, Date.now());
+      savePrintedOrders(storeId, printed);
+    }
+    void markReceiptPrintedRef.current(order.id);
+    return true;
+  };
+
   // Mantém o ref de impressão apontando para o printOrder atual, para o polling
   // (memoizado) imprimir sempre com as configurações/loja mais recentes.
   useEffect(() => { printOrderRef.current = printOrder; });
   useEffect(() => { markReceiptPrintedRef.current = markReceiptPrinted; });
+  useEffect(() => { reprintReceiptRef.current = reprintReceipt; });
 
   // Aplica a mudança de status localmente (otimista), movendo o pedido entre as
   // listas na hora. O realtime confirma/reconcilia em seguida. Lê o estado atual
