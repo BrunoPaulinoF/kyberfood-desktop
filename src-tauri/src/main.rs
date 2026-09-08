@@ -509,7 +509,7 @@ fn test_printer(printer_name: Option<String>) -> Result<(), String> {
 ================================
        TESTE DE IMPRESSAO
 ================================
-KyberFood Desktop
+KyberFood Impressora
 Impressora funcionando!
 ================================
 "
@@ -649,6 +649,11 @@ const RENDERER_SILENCE_RELOAD_SECS: u64 = 120;
 /// janela aparecendo do que a loja muda perdendo venda.
 const RENDERER_SILENCE_SHOW_SECS: u64 = 240;
 
+/// Nome do evento que a interface escuta para avisar "o KyberFood já estava aberto".
+/// ESPELHADO em `src/App.tsx` (SINGLE_INSTANCE_EVENT) — são projetos separados, sem import
+/// entre eles: renomear de um lado só faz o aviso sumir sem erro nenhum.
+const SINGLE_INSTANCE_EVENT: &str = "kyberfood-already-running";
+
 fn main() {
     // Mata o congelamento de timers em janela oculta ANTES de o WebView2 subir (a variável
     // é lida na criação do ambiente do webview, então precisa estar posta aqui).
@@ -675,6 +680,35 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
+        // UMA instância por computador, e este plugin vem ANTES de todos os outros: ele é
+        // quem decide se ESTE processo continua vivo, e nada deve rodar antes dessa decisão.
+        //
+        // O app fecha para a BANDEJA (o X esconde a janela, `CloseRequested` abaixo), então
+        // quem pensa que fechou clica no atalho de novo — e antes disto subia um SEGUNDO
+        // processo, invisível, imprimindo a MESMA comanda e disputando a mesma linha de
+        // presença. Agora o processo novo morre aqui e o que já estava rodando é trazido
+        // para a frente, que é o que a pessoa queria ao clicar no atalho.
+        //
+        // O aviso NA TELA é o par obrigatório do foco: sem ele a janela aparece do nada e
+        // quem clicou continua sem entender por que "não abriu outro".
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Segunda partida vinda do AUTOSTART do Windows (`--minimized`) não é alguém
+            // clicando no atalho: ali ninguém está olhando, e abrir a janela no boot só
+            // assustaria a loja. O processo extra morre do mesmo jeito, em silêncio.
+            if argv.iter().any(|arg| arg == "--minimized") {
+                return;
+            }
+            let window = match app.get_window("main") {
+                Some(w) => w,
+                None => return,
+            };
+            // Nesta ordem: a janela pode estar ESCONDIDA (bandeja) e MINIMIZADA ao mesmo
+            // tempo — focar sem mostrar não traz nada para a tela.
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            let _ = app.emit_all(SINGLE_INSTANCE_EVENT, ());
+        }))
         .manage(RendererWatchdog {
             last_ping: std::sync::Mutex::new(std::time::Instant::now()),
         })

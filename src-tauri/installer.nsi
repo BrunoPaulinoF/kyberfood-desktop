@@ -1,5 +1,5 @@
 ; ============================================================================
-; TEMPLATE DO INSTALADOR NSIS — CÓPIA do tauri-bundler, com DUAS mudanças.
+; TEMPLATE DO INSTALADOR NSIS — CÓPIA do tauri-bundler, com TRÊS mudanças.
 ;
 ; Por que existe: o Tauri 1.x não tem opção de configuração para o atalho da
 ; área de trabalho (não há hook nem campo em `bundle.windows.nsis`), e o
@@ -9,7 +9,7 @@
 ; ORIGEM: tooling/bundler/src/bundle/windows/templates/installer.nsi da tag
 ; tauri-cli-v1.6.3 (a versão em package-lock.json), byte a byte igual ao 1.x.
 ;
-; AO ATUALIZAR O TAURI: recopie o template da tag nova e refaça as DUAS mudanças
+; AO ATUALIZAR O TAURI: recopie o template da tag nova e refaça as TRÊS mudanças
 ; abaixo — elas estão marcadas com "[KYBERFOOD]" e são o que a trava
 ; src/lib/desktop-nsis-template.test.ts procura. Recopiar sem refazê-las volta a
 ; marcar o atalho, e nada acusa.
@@ -19,6 +19,14 @@
 ;   ATUALIZAÇÃO AUTOMÁTICA passa (updater.windows.installMode = "passive"), e
 ;   sem isso o atalho voltaria sozinho a cada versão nova, desfazendo a escolha
 ;   do lojista. O atalho do menu Iniciar continua sendo criado nos dois casos.
+; MUDANÇA 3 — o ATALHO se chama "KyberFood Impressora", não "KyberFood". O app e
+;   o site tinham o mesmo nome e a equipe da loja confundia os dois. Só o atalho
+;   muda: a pasta de instalação, o executável e a entrada em "Programas e
+;   Recursos" continuam com o nome de sempre, porque são eles que a atualização
+;   automática usa para achar a instalação anterior — renomeá-los deixaria DUAS
+;   instalações na mesma máquina, e o atalho antigo abriria a versão velha para
+;   sempre. O atalho que já existe é RENOMEADO (nunca apagado e recriado): quem
+;   escolheu ter atalho continua com ele, quem não quis continua sem.
 ; ============================================================================
 
 Unicode true
@@ -49,6 +57,9 @@ ${StrLoc}
 !define SIDEBARIMAGE "{{sidebar_image}}"
 !define HEADERIMAGE "{{header_image}}"
 !define MAINBINARYNAME "{{main_binary_name}}"
+; [KYBERFOOD] mudança 3: o nome que aparece embaixo do ícone. Fica separado do
+; MAINBINARYNAME de propósito — o binário, a pasta e o registro não podem mudar.
+!define SHORTCUTNAME "KyberFood Impressora"
 !define MAINBINARYSRCPATH "{{main_binary_path}}"
 !define BUNDLEID "{{bundle_id}}"
 !define COPYRIGHT "{{copyright}}"
@@ -65,6 +76,19 @@ ${StrLoc}
 !define MANUPRODUCTKEY "Software\${MANUFACTURER}\${PRODUCTNAME}"
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
+
+; [KYBERFOOD] mudança 3: leva o atalho que já existe na máquina para o nome novo.
+; RENOMEAR, e não apagar e recriar: quem escolheu ter o atalho na área de trabalho
+; continua com ele, e quem não quis continua sem — a caixa da instalação nasce
+; desmarcada justamente para essa escolha ser do lojista (mudança 1).
+!macro RenameLegacyShortcut folder
+  !if "${SHORTCUTNAME}" != "${MAINBINARYNAME}"
+    ${If} ${FileExists} "${folder}\${MAINBINARYNAME}.lnk"
+      Delete "${folder}\${SHORTCUTNAME}.lnk"
+      Rename "${folder}\${MAINBINARYNAME}.lnk" "${folder}\${SHORTCUTNAME}.lnk"
+    ${EndIf}
+  !endif
+!macroend
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -610,6 +634,11 @@ Section Install
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoRepair" "1"
   WriteRegDWORD SHCTX "${UNINSTKEY}" "EstimatedSize" "${ESTIMATEDSIZE}"
 
+  ; [KYBERFOOD] mudança 3: o atalho da área de trabalho não é recriado na
+  ; atualização automática (mudança 2), então quem já tem um precisa vê-lo
+  ; renomeado aqui — senão o ícone continuaria dizendo "KyberFood" para sempre.
+  !insertmacro RenameLegacyShortcut "$DESKTOP"
+
   ; Create start menu shortcut (GUI)
   !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
     Call CreateStartMenuShortcut
@@ -713,15 +742,22 @@ Section Uninstall
   RMDir "$INSTDIR"
 
   !insertmacro DeleteAppUserModelId
+  ; [KYBERFOOD] mudança 3: os DOIS nomes saem. O antigo continua existindo na
+  ; máquina de quem desinstalar antes de atualizar — deixá-lo para trás poria um
+  ; atalho quebrado na área de trabalho.
+  !insertmacro UnpinShortcut "$SMPROGRAMS\$AppStartMenuFolder\${SHORTCUTNAME}.lnk"
   !insertmacro UnpinShortcut "$SMPROGRAMS\$AppStartMenuFolder\${MAINBINARYNAME}.lnk"
+  !insertmacro UnpinShortcut "$DESKTOP\${SHORTCUTNAME}.lnk"
   !insertmacro UnpinShortcut "$DESKTOP\${MAINBINARYNAME}.lnk"
 
   ; Remove start menu shortcut
   !insertmacro MUI_STARTMENU_GETFOLDER Application $AppStartMenuFolder
+  Delete "$SMPROGRAMS\$AppStartMenuFolder\${SHORTCUTNAME}.lnk"
   Delete "$SMPROGRAMS\$AppStartMenuFolder\${MAINBINARYNAME}.lnk"
   RMDir "$SMPROGRAMS\$AppStartMenuFolder"
 
   ; Remove desktop shortcuts
+  Delete "$DESKTOP\${SHORTCUTNAME}.lnk"
   Delete "$DESKTOP\${MAINBINARYNAME}.lnk"
 
   ; Remove registry information for add/remove programs
@@ -793,12 +829,16 @@ FunctionEnd
 !macroend
 
 Function CreateDesktopShortcut
-  CreateShortcut "$DESKTOP\${MAINBINARYNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-  !insertmacro SetLnkAppUserModelId "$DESKTOP\${MAINBINARYNAME}.lnk"
+  ; [KYBERFOOD] mudança 3: o atalho leva o nome do APP, não o do binário.
+  CreateShortcut "$DESKTOP\${SHORTCUTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+  !insertmacro SetLnkAppUserModelId "$DESKTOP\${SHORTCUTNAME}.lnk"
 FunctionEnd
 
 Function CreateStartMenuShortcut
   CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
-  CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${MAINBINARYNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-  !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${MAINBINARYNAME}.lnk"
+  ; [KYBERFOOD] mudança 3: o do menu Iniciar é recriado a cada atualização, então
+  ; o antigo é removido aqui — sem isso a loja ficaria com duas entradas iguais.
+  !insertmacro RenameLegacyShortcut "$SMPROGRAMS\$AppStartMenuFolder"
+  CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${SHORTCUTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+  !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${SHORTCUTNAME}.lnk"
 FunctionEnd

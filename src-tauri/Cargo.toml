@@ -17,6 +17,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 printpdf = "0.5"
 tauri-plugin-autostart = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
+# UMA instância por computador. O app fecha para a BANDEJA (o X esconde a janela), então
+# quem acha que fechou clica no atalho de novo e sobe um SEGUNDO processo: dois apps
+# imprimindo a mesma comanda e dois heartbeats disputando a mesma linha de presença.
+# O plugin mata o processo novo e devolve o foco para a janela que já está rodando.
+tauri-plugin-single-instance = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
 lopdf = "0.31"
 # Rasteriza a comanda em MODO GRÁFICO com uma fonte TTF (src/receipt_raster.rs). Puro Rust.
 ab_glyph = "0.2"

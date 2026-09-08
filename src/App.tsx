@@ -30,8 +30,24 @@ import { open as openExternal } from '@tauri-apps/api/shell';
 import { checkUpdate, installUpdate } from '@tauri-apps/api/updater';
 import { relaunch } from '@tauri-apps/api/process';
 import { fetch as tauriFetch, Body, ResponseType } from '@tauri-apps/api/http';
+import { listen } from '@tauri-apps/api/event';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_IPC__' in window;
+
+/**
+ * Avisado pelo Rust quando alguém tenta abrir o app UMA SEGUNDA VEZ.
+ *
+ * O app fecha para a bandeja, então quem acha que fechou clica no atalho de novo. O
+ * processo novo morre no plugin de instância única (`src-tauri/src/main.rs`) e esta janela
+ * é trazida para a frente — o aviso é o que explica por que a janela "apareceu sozinha".
+ *
+ * ESPELHA `SINGLE_INSTANCE_EVENT` do main.rs: são projetos separados, sem import entre
+ * eles, então renomear de um lado só faz o aviso sumir SEM erro nenhum.
+ */
+const SINGLE_INSTANCE_EVENT = 'kyberfood-already-running';
+
+/** Quanto tempo o aviso de "já estava aberto" fica na tela antes de sumir sozinho. */
+const ALREADY_OPEN_NOTICE_MS = 12_000;
 
 /**
  * Requisição HTTP que sai pelo RUST quando rodando dentro do app.
@@ -936,6 +952,18 @@ function App() {
   // das retentativas, e é o que avisa o lojista de que a IA está prestes a parar.
   const [aiServing, setAiServing] = useState(true);
   const [heartbeatFailing, setHeartbeatFailing] = useState(false);
+  // Modo da trava de presença desta loja, respondido pelo mesmo heartbeat. Só em
+  // 'enforce' fechar/sair daqui derruba a IA — dizer isso na loja em 'off' seria um susto
+  // falso, então a confirmação de saída só cita a IA quando é verdade.
+  const [aiGateMode, setAiGateMode] = useState<string | null>(null);
+  // Alguém tentou abrir o app pela SEGUNDA vez: esta janela foi trazida para a frente e o
+  // aviso explica por quê (ver SINGLE_INSTANCE_EVENT).
+  const [alreadyOpenNotice, setAlreadyOpenNotice] = useState(false);
+  // Confirmação da saída da conta. O botão fica ao lado do de configurações e NÃO pedia
+  // nada: um clique errado deslogava a loja, e sem login o app não imprime comanda
+  // nenhuma — foi assim que a Leley Sorvetes Tanabi passou dois dias sem imprimir
+  // (05/09/2026, um clique em "Sair da conta" às 17:27; ninguém percebeu).
+  const [confirmLogout, setConfirmLogout] = useState(false);
   // Relogin automático em andamento: mostra "Reconectando…" em vez da tela de login, para
   // ninguém achar que precisa digitar a senha (e para o app não parecer deslogado).
   const [reconnecting, setReconnecting] = useState(false);
@@ -1089,6 +1117,45 @@ function App() {
     return () => clearTimeout(timer);
   }, [updateCheck]);
 
+  // "O KyberFood já está aberto": quem clica no atalho pela segunda vez tem a janela
+  // trazida para a frente pelo Rust (plugin de instância única) e lê aqui o porquê. Sem
+  // esta linha a janela apareceria do nada e a pessoa continuaria clicando no atalho.
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    void listen(SINGLE_INSTANCE_EVENT, () => {
+      if (cancelled) return;
+      setAlreadyOpenNotice(true);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      // Falhar aqui custa o aviso, nunca o app: a janela continua sendo trazida para a
+      // frente pelo Rust, que é a metade que resolve o problema.
+      .catch((err) => console.warn('Falha ao ouvir o aviso de app já aberto:', err));
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // O aviso some sozinho: ele explica um clique que já passou, e ficar para sempre na tela
+  // vira ruído em cima dos avisos que o lojista PRECISA ler (impressora, conexão).
+  useEffect(() => {
+    if (!alreadyOpenNotice) return;
+    const timer = setTimeout(() => setAlreadyOpenNotice(false), ALREADY_OPEN_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [alreadyOpenNotice]);
+
+  // Sessão caiu com a confirmação aberta (o relogin automático leva a tela para
+  // "Reconectando…"): ao voltar, o modal reapareceria perguntando se a pessoa quer sair de
+  // uma conta que ela nunca pediu para deixar.
+  useEffect(() => {
+    if (!isAuthenticated) setConfirmLogout(false);
+  }, [isAuthenticated]);
+
   const handleUpdateClick = async () => {
     if (!updateInfo) return;
 
@@ -1160,7 +1227,13 @@ function App() {
         // um bloqueio de CORS aqui deixaria a loja "offline" para o servidor sem nenhum
         // sintoma visível — o mesmo tipo de falha silenciosa que quebrava a verificação
         // de atualização.
-        const res = await httpJson<{ print_config?: unknown; ai_gate?: { ai_serving?: boolean } }>(
+        const res = await httpJson<{
+          print_config?: unknown;
+          // `mode` é a trava de presença DESTA loja ('off' | 'warn' | 'enforce'):
+          // só em 'enforce' fechar o app derruba a IA, e é isso que decide se a
+          // confirmação de saída pode dizer que a atendente vai parar.
+          ai_gate?: { ai_serving?: boolean; mode?: string };
+        }>(
           `${apiUrl}/api/desktop/heartbeat?storeId=${store.id}`,
           {
             method: 'POST',
@@ -1181,6 +1254,7 @@ function App() {
         if (cancelled) return;
         if (data?.print_config) setPrintConfig(normalizePrintConfig(data.print_config));
         setAiServing(data?.ai_gate?.ai_serving !== false);
+        setAiGateMode(typeof data?.ai_gate?.mode === 'string' ? data.ai_gate.mode : null);
         setHeartbeatFailing(false);
       } catch (err) {
         console.warn('Falha no heartbeat do desktop:', err);
@@ -2194,7 +2268,9 @@ function App() {
     }
   };
 
-  // Logout EXPLÍCITO (botão dentro do app) — a ÚNICA forma de a conta sair de verdade.
+  // Logout EXPLÍCITO — a ÚNICA forma de a conta sair de verdade, e agora só depois do
+  // "sim" na confirmação (LogoutConfirmModal): o botão fica ao lado do de configurações
+  // e um clique errado deixa a loja sem imprimir até alguém digitar a senha de novo.
   // Fora daqui o login é permanente: fechar pela bandeja, reiniciar o PC, ficar dias sem
   // internet ou perder a sessão não desconectam nada — o app refaz o login sozinho com a
   // credencial salva. Por isso este é também o único ponto que apaga essa credencial.
@@ -2283,7 +2359,12 @@ function App() {
 
   // Render login if not authenticated
   if (!isAuthenticated) {
-    return <LoginScreen onLogin={handleLogin} error={error} />;
+    return (
+      <>
+        {alreadyOpenNotice && <AlreadyOpenNotice onClose={() => setAlreadyOpenNotice(false)} />}
+        <LoginScreen onLogin={handleLogin} error={error} />
+      </>
+    );
   }
 
   return (
@@ -2292,7 +2373,7 @@ function App() {
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <h1 className="text-xl font-bold text-orange-500">KyberFood</h1>
+            <h1 className="text-xl font-bold text-orange-500">KyberFood Impressora</h1>
             <span className="text-gray-400">|</span>
             <span className="text-gray-300">{store?.name}</span>
 
@@ -2461,7 +2542,7 @@ function App() {
           settings={settings}
           lastOrderInfo={lastOrderInfo}
           onOpenSettings={() => setShowSettings(true)}
-          onLogout={handleLogout}
+          onLogout={() => setConfirmLogout(true)}
         />
       )}
 
@@ -2577,9 +2658,24 @@ function App() {
           store={store!}
           onClose={() => setShowSettings(false)}
           onSave={setSettings}
-          onLogout={handleLogout}
+          onLogout={() => setConfirmLogout(true)}
         />
       )}
+
+      {/* Confirmação da saída — POR CIMA do modal de configurações, que também tem o botão. */}
+      {confirmLogout && (
+        <LogoutConfirmModal
+          storeName={store?.name ?? ''}
+          aiWillStop={aiGateMode === 'enforce'}
+          onCancel={() => setConfirmLogout(false)}
+          onConfirm={() => {
+            setConfirmLogout(false);
+            void handleLogout();
+          }}
+        />
+      )}
+
+      {alreadyOpenNotice && <AlreadyOpenNotice onClose={() => setAlreadyOpenNotice(false)} />}
     </div>
   );
 }
@@ -2672,6 +2768,108 @@ function StatusPanel({
   );
 }
 
+/**
+ * Confirmação de saída da conta.
+ *
+ * O botão "Sair da conta" fica logo abaixo do de configurações, não pedia nada e a saída é
+ * irreversível na prática: ela apaga a credencial do relogin automático, então o app fica
+ * na tela de login até alguém digitar a senha — e, sem login, NADA imprime.
+ *
+ * Foi assim que a Leley Sorvetes Tanabi ficou 2 dias sem comanda (05/09/2026, 17:27): um
+ * clique, nenhum aviso, 9 pedidos entregues sem papel. Ninguém percebeu porque os pedidos
+ * continuaram entrando normalmente pelo WhatsApp.
+ *
+ * O botão em destaque é o SEGURO ("Continuar conectado"): quem chegou aqui por engano sai
+ * pelo caminho de menor resistência.
+ */
+function LogoutConfirmModal({
+  storeName,
+  aiWillStop,
+  onCancel,
+  onConfirm,
+}: {
+  storeName: string;
+  aiWillStop: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60] p-4">
+      <div className="bg-gray-800 rounded-2xl border border-gray-700 max-w-md w-full p-6">
+        <div className="flex items-start gap-3 mb-4">
+          <div className="w-10 h-10 rounded-full bg-red-600/20 flex items-center justify-center shrink-0">
+            <LogOut className="w-5 h-5 text-red-400" />
+          </div>
+          <div>
+            <h3 className="text-lg font-bold">Sair da conta?</h3>
+            <p className="text-gray-400 text-sm">{storeName}</p>
+          </div>
+        </div>
+
+        <div className="rounded-lg bg-red-900/30 border border-red-500/50 px-4 py-3 mb-4">
+          <p className="text-red-200 font-bold text-sm mb-1">
+            As comandas vão PARAR de imprimir neste computador.
+          </p>
+          <p className="text-red-100/80 text-sm">
+            Os pedidos continuam chegando pelo WhatsApp normalmente, mas nenhum sai no papel
+            até alguém entrar de novo aqui.
+            {aiWillStop && ' A atendente também deixa de responder os clientes.'}
+          </p>
+        </div>
+
+        <p className="text-gray-400 text-sm mb-6">
+          Para só tirar a janela da frente, feche no <span className="text-gray-200 font-medium">X</span>:
+          o app continua trabalhando na barra do relógio e não precisa sair da conta.
+        </p>
+
+        <div className="flex flex-col gap-2">
+          <button
+            onClick={onCancel}
+            className="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold py-2.5 rounded-lg"
+          >
+            Continuar conectado
+          </button>
+          <button
+            onClick={onConfirm}
+            className="w-full text-red-300 hover:text-red-200 border border-red-500/40 hover:border-red-500 py-2.5 rounded-lg text-sm"
+          >
+            Sair mesmo assim
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "O KyberFood já estava aberto." Aparece quando alguém clica no atalho pela segunda vez:
+ * o Rust mata o processo novo e traz ESTA janela para a frente, e sem uma palavra na tela
+ * a janela pareceria ter aparecido do nada — a pessoa clicaria no atalho mais uma vez.
+ */
+function AlreadyOpenNotice({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[70] max-w-md w-[calc(100%-2rem)]">
+      <div className="bg-gray-800 border border-orange-500/60 rounded-xl shadow-xl px-4 py-3 flex items-start gap-3">
+        <CheckCircle2 className="w-5 h-5 text-orange-400 shrink-0 mt-0.5" />
+        <div className="text-sm">
+          <p className="font-bold text-gray-100">O KyberFood já está aberto</p>
+          <p className="text-gray-400">
+            É esta janela aqui — não precisa abrir de novo. Ele fica sempre ligado na barra do
+            relógio, ao lado do horário.
+          </p>
+        </div>
+        <button
+          onClick={onClose}
+          className="p-1 hover:bg-gray-700 rounded-full shrink-0"
+          title="Fechar aviso"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // Login Screen Component
 function LoginScreen({ onLogin, error }: { onLogin: (email: string, password: string) => void; error: string | null }) {
   // Abre com o último login já digitado: quem saiu (ou perdeu a sessão) volta clicando
@@ -2684,7 +2882,7 @@ function LoginScreen({ onLogin, error }: { onLogin: (email: string, password: st
   return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center">
       <div className="bg-gray-800 p-8 rounded-xl w-96">
-        <h1 className="text-2xl font-bold text-center mb-6 text-orange-500">KyberFood Desktop</h1>
+        <h1 className="text-2xl font-bold text-center mb-6 text-orange-500">KyberFood Impressora</h1>
         
         {error && (
           <div className="bg-red-900/50 border border-red-500 text-red-200 p-3 rounded-lg mb-4">
