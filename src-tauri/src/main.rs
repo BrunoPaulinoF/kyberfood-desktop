@@ -2,6 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod receipt_raster;
+// Impressão pela API do Windows, sem PowerShell (ver o cabeçalho do arquivo).
+#[cfg(target_os = "windows")]
+mod win_print;
 
 use printpdf::*;
 use serde::{Deserialize, Serialize};
@@ -14,74 +17,31 @@ pub struct PrinterInfo {
     is_default: bool,
 }
 
-/// Cria um `Command` de powershell já configurado para NÃO abrir janela de
-/// console no Windows. Mesmo com o app em `windows_subsystem = "windows"`, cada
-/// processo filho `powershell` abre um console próprio que "pisca" na tela —
-/// era o que aparecia a cada novo pedido ao imprimir a comanda. A flag
-/// CREATE_NO_WINDOW (0x08000000) faz o processo rodar totalmente oculto.
-fn powershell_command() -> std::process::Command {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new("powershell")
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PrintOptions {
     printer_name: Option<String>,
     width: Option<i32>,
 }
 
-/// Get list of available printers
+/// Lista as impressoras disponíveis.
+///
+/// Vem de `EnumPrintersW` (a API do próprio Windows), não mais de uma consulta WMI rodada
+/// por um PowerShell oculto — ver o cabeçalho de `win_print.rs` para o porquê.
 #[tauri::command]
 fn get_printers() -> Vec<PrinterInfo> {
-    // Win32_Printer expõe a coluna `Default` (a impressora padrão do Windows).
-    // O antigo `Get-Printer | Select isDefault` NÃO tem essa propriedade, então
-    // `is_default` vinha sempre falso e o app nunca pré-selecionava a padrão.
-    let output = powershell_command()
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance -ClassName Win32_Printer | Select-Object Name, Default | ConvertTo-Json -Compress",
-        ])
-        .output();
+    #[cfg(target_os = "windows")]
+    {
+        win_print::list_printers()
+            .into_iter()
+            .map(|(name, is_default)| PrinterInfo { name, is_default })
+            .collect()
+    }
 
-    match output {
-        Ok(out) => {
-            let json_str = String::from_utf8_lossy(&out.stdout);
-            let trimmed = json_str.trim();
-
-            // Handle both single object or array from ConvertTo-Json
-            if trimmed.starts_with('{') {
-                if let Ok(p) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    return vec![PrinterInfo {
-                        name: p["Name"].as_str().unwrap_or("Unknown").to_string(),
-                        is_default: p["Default"].as_bool().unwrap_or(false),
-                    }];
-                }
-            } else if trimmed.starts_with('[') {
-                if let Ok(printers) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
-                    return printers
-                        .into_iter()
-                        .map(|p| PrinterInfo {
-                            name: p["Name"].as_str().unwrap_or("Unknown").to_string(),
-                            is_default: p["Default"].as_bool().unwrap_or(false),
-                        })
-                        .collect();
-                }
-            }
-            vec![]
-        }
-        Err(_) => vec![],
+    // macOS/Linux são só ambiente de desenvolvimento: não há spooler do Windows para
+    // consultar, e o caminho antigo (PowerShell) também devolvia lista vazia aqui.
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
     }
 }
 
@@ -201,149 +161,13 @@ fn build_escpos(content: &str, font_pt: f64) -> Vec<u8> {
     bytes
 }
 
-/// Envia bytes RAW direto ao spooler do Windows (datatype "RAW"), via um helper
-/// P/Invoke (winspool) carregado por Add-Type. É o mesmo mecanismo que todo
-/// software de PDV usa: NÃO depende de leitor de PDF, driver GDI nem diálogo —
-/// por isso "sempre imprime". Retorna Err com a causa quando o spooler recusa.
-#[cfg(target_os = "windows")]
-fn send_raw_to_printer(printer: &str, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-
-    // Grava os bytes da comanda num arquivo temporário que o PowerShell lê.
-    let bin_path = std::env::temp_dir().join("kyberfood_receipt.bin");
-    let mut f = File::create(&bin_path).map_err(|e| e.to_string())?;
-    f.write_all(bytes).map_err(|e| e.to_string())?;
-    drop(f);
-
-    // Escapa aspas simples ('' = ') para embutir com segurança em strings PS.
-    let printer_escaped = printer.replace('\'', "''");
-    let bin_escaped = bin_path.to_string_lossy().replace('\'', "''");
-
-    // Helper RawPrinterHelper (padrão consagrado da Microsoft) que abre a
-    // impressora, inicia um documento RAW e escreve os bytes direto no spooler.
-    let script = format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         $printerName = '{printer}'\n\
-         $filePath = '{file}'\n\
-         Add-Type -TypeDefinition @'\n\
-using System;\n\
-using System.IO;\n\
-using System.Runtime.InteropServices;\n\
-public class KyberRawPrinter {{\n\
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]\n\
-  public class DOCINFOW {{\n\
-    [MarshalAs(UnmanagedType.LPWStr)] public string pDocName;\n\
-    [MarshalAs(UnmanagedType.LPWStr)] public string pOutputFile;\n\
-    [MarshalAs(UnmanagedType.LPWStr)] public string pDataType;\n\
-  }}\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"OpenPrinterW\", SetLastError = true, CharSet = CharSet.Unicode)]\n\
-  public static extern bool OpenPrinter([MarshalAs(UnmanagedType.LPWStr)] string src, out IntPtr hPrinter, IntPtr pd);\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"ClosePrinter\", SetLastError = true)]\n\
-  public static extern bool ClosePrinter(IntPtr hPrinter);\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"StartDocPrinterW\", SetLastError = true, CharSet = CharSet.Unicode)]\n\
-  public static extern bool StartDocPrinter(IntPtr hPrinter, Int32 level, [In, MarshalAs(UnmanagedType.LPStruct)] DOCINFOW di);\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"EndDocPrinter\", SetLastError = true)]\n\
-  public static extern bool EndDocPrinter(IntPtr hPrinter);\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"StartPagePrinter\", SetLastError = true)]\n\
-  public static extern bool StartPagePrinter(IntPtr hPrinter);\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"EndPagePrinter\", SetLastError = true)]\n\
-  public static extern bool EndPagePrinter(IntPtr hPrinter);\n\
-  [DllImport(\"winspool.Drv\", EntryPoint = \"WritePrinter\", SetLastError = true)]\n\
-  public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, Int32 dwCount, out Int32 dwWritten);\n\
-  public static void Send(string printer, byte[] bytes) {{\n\
-    IntPtr hPrinter;\n\
-    if (!OpenPrinter(printer, out hPrinter, IntPtr.Zero))\n\
-      throw new Exception(\"OpenPrinter falhou (\" + Marshal.GetLastWin32Error() + \") para a impressora '\" + printer + \"'\");\n\
-    try {{\n\
-      DOCINFOW di = new DOCINFOW();\n\
-      di.pDocName = \"KyberFood Comanda\";\n\
-      di.pDataType = \"RAW\";\n\
-      if (!StartDocPrinter(hPrinter, 1, di))\n\
-        throw new Exception(\"StartDocPrinter falhou (\" + Marshal.GetLastWin32Error() + \")\");\n\
-      try {{\n\
-        if (!StartPagePrinter(hPrinter))\n\
-          throw new Exception(\"StartPagePrinter falhou (\" + Marshal.GetLastWin32Error() + \")\");\n\
-        IntPtr pBytes = Marshal.AllocHGlobal(bytes.Length);\n\
-        try {{\n\
-          Marshal.Copy(bytes, 0, pBytes, bytes.Length);\n\
-          Int32 written;\n\
-          if (!WritePrinter(hPrinter, pBytes, bytes.Length, out written))\n\
-            throw new Exception(\"WritePrinter falhou (\" + Marshal.GetLastWin32Error() + \")\");\n\
-        }} finally {{ Marshal.FreeHGlobal(pBytes); }}\n\
-        EndPagePrinter(hPrinter);\n\
-      }} finally {{ EndDocPrinter(hPrinter); }}\n\
-    }} finally {{ ClosePrinter(hPrinter); }}\n\
-  }}\n\
-}}\n\
-'@\n\
-         $bytes = [System.IO.File]::ReadAllBytes($filePath)\n\
-         [KyberRawPrinter]::Send($printerName, $bytes)\n",
-        printer = printer_escaped,
-        file = bin_escaped,
-    );
-
-    // Grava o script num .ps1 e roda com bypass da política de execução, sem
-    // perfil e sem interação (evita travar em qualquer prompt).
-    let ps_path = std::env::temp_dir().join("kyberfood_print.ps1");
-    std::fs::write(&ps_path, &script).map_err(|e| e.to_string())?;
-
-    let output = powershell_command()
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &ps_path.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else {
-            stdout.trim().to_string()
-        };
-        return Err(if detail.is_empty() {
-            "Spooler recusou a impressão RAW".to_string()
-        } else {
-            detail
-        });
-    }
-
-    Ok(())
-}
-
-/// Fallback: gera um PDF e imprime via `Start-Process -Verb PrintTo`. Depende de
-/// um leitor de PDF com o verbo PrintTo (nem sempre presente) — por isso é o
+/// Fallback: gera um PDF e o entrega ao leitor padrão pelo verbo `printto` do Windows.
+/// Depende de haver um leitor de PDF associado (nem sempre presente) — por isso é o
 /// PLANO B, usado só quando a impressão RAW falha (ex.: impressora não-térmica).
 #[cfg(target_os = "windows")]
 fn print_via_pdf(printer: &str, content: &str, width: i32, font_pt: f64) -> Result<(), String> {
     let temp_path = render_receipt_pdf(content, width, font_pt)?;
-
-    let printer_escaped = printer.replace('\'', "''");
-    let path_str = temp_path.to_string_lossy();
-
-    let output = powershell_command()
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Start-Process -FilePath '{}' -Verb PrintTo '{}' -Wait",
-                path_str, printer_escaped
-            ),
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(())
+    win_print::print_document(printer, &temp_path)
 }
 
 /// Gera o PDF da comanda (usado pelo fallback do Windows e pela impressão via lp
@@ -421,7 +245,7 @@ fn print_receipt(
     {
         // 1) Caminho confiável: RAW/ESC-POS direto no spooler.
         let raw_bytes = build_escpos(&content, font_pt);
-        match send_raw_to_printer(&printer, &raw_bytes) {
+        match win_print::send_raw(&printer, &raw_bytes) {
             Ok(()) => return Ok(()),
             Err(raw_err) => {
                 // 2) Fallback: PDF + PrintTo (impressoras não-térmicas / sem ESC/POS).
@@ -481,7 +305,7 @@ fn print_receipt_graphic(
     #[cfg(target_os = "windows")]
     {
         let graphic_err = match receipt_raster::build_escpos_graphic(&layout, receipt_width_chars, font_pt) {
-            Ok(bytes) => match send_raw_to_printer(&printer, &bytes) {
+            Ok(bytes) => match win_print::send_raw(&printer, &bytes) {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             },
