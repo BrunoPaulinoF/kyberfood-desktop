@@ -413,6 +413,42 @@ function formatOrderPayments(order: Order): string {
   return `${(order.payment_method || '').toUpperCase()}${orderChangeText}`;
 }
 
+// TROCO A DEVOLVER: quanto o entregador separa na carteira. ESPELHO de
+// src/lib/order-change.ts no app web (projetos separados, sem import entre eles) —
+// mudou lá, muda aqui.
+//
+// A BASE É A PARCELA EM DINHEIRO, nunca o total: no pagamento dividido o troco é sobre o
+// que vai ser pago em dinheiro. Devolve null sem troco, com troco ZERO (ruído numa ficha
+// lida de relance) e com troco NEGATIVO (cadastro incoerente, que a cozinha leria como
+// erro de sistema).
+function resolveOrderChange(order: Order): { changeFor: number; cashAmount: number; changeDue: number } | null {
+  const payments = order.metadata?.saipos?.payment_types;
+  let changeFor = 0;
+  let cashAmount = 0;
+
+  if (Array.isArray(payments) && payments.length > 0) {
+    for (const payment of payments) {
+      const paymentChangeFor = Number(payment?.change_for) || 0;
+      if (paymentChangeFor <= 0) continue;
+      changeFor += paymentChangeFor;
+      cashAmount += Number(payment?.amount) || 0;
+    }
+  } else {
+    changeFor = Number(order.change_for) || 0;
+    cashAmount = Number(order.total) || 0;
+  }
+
+  if (changeFor <= 0) return null;
+  const changeDue = Math.round((changeFor - cashAmount) * 100) / 100;
+  if (changeDue <= 0) return null;
+  return { changeFor, cashAmount, changeDue };
+}
+
+// Rótulo da linha do troco na comanda. Diz o ATO ("levar"), nunca só "TROCO": a linha de
+// cima já traz "(troco p/ R$ 100,00)" e um "TROCO:" solto seria lido como outro "troco
+// para". Espelho de CHANGE_RECEIPT_LABEL no web.
+const CHANGE_RECEIPT_LABEL = '*** LEVAR DE TROCO:';
+
 // PIX pago ONLINE ainda aguardando o pagamento cair. O pedido nasce em
 // 'ai_attention' com payment_status 'pending' — o QR é gerado, mas o cliente
 // ainda não pagou. Só quando o webhook do Asaas confirma o PIX é que o pedido é
@@ -3139,6 +3175,18 @@ function OrderDetails({
             {order.payment_status === 'paid' ? 'Pago ✓' : 'Pendente'}
           </span>
         </div>
+        {/* Troco a devolver: quem olha o pedido na tela precisa do mesmo número que sai no
+            papel — senão a conta continua sendo feita de cabeça. */}
+        {(() => {
+          const change = resolveOrderChange(order);
+          if (!change) return null;
+          return (
+            <div className="mt-3 rounded bg-orange-950 px-3 py-2 text-orange-200">
+              <span className="font-bold">Levar de troco: {formatReceiptMoney(change.changeDue)}</span>
+              <span className="ml-2 text-sm opacity-80">(cliente paga com {formatReceiptMoney(change.changeFor)})</span>
+            </div>
+          );
+        })()}
       </div>
       
       {/* Actions */}
@@ -3631,6 +3679,11 @@ function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): Re
 
   if (config.showPayment && (order.payment_method || order.metadata?.saipos?.payment_types?.length)) {
     text({ text: `PAGAMENTO: ${formatOrderPayments(order)}`, strong: true, wrap: true });
+    // TROCO A DEVOLVER em linha PRÓPRIA e em destaque: a linha de pagamento sempre disse
+    // para quanto o cliente pede troco e nunca disse o troco, e a conta ficava para quem
+    // monta a sacola fazer de cabeça.
+    const change = resolveOrderChange(order);
+    if (change) text({ text: `${CHANGE_RECEIPT_LABEL} ${money(change.changeDue)} ***`, strong: true });
     text({ text: `STATUS: ${order.payment_status === 'paid' ? 'PAGO' : 'PENDENTE'}` });
   }
 
@@ -3743,6 +3796,10 @@ function generateReceiptHtml(order: Order, store: Store): string {
   lines.push(`<div style="text-align: right; font-weight: bold; font-size: 14px;">TOTAL: ${formatReceiptMoney(order.total)}</div>`);
   lines.push('<hr>');
   lines.push(`<div>PAGAMENTO: ${escapeHtml(formatOrderPayments(order))} ${order.payment_status === 'paid' ? '✓' : ''}</div>`);
+  const receiptChange = resolveOrderChange(order);
+  if (receiptChange) {
+    lines.push(`<div style="font-weight: bold; font-size: 14px;">${escapeHtml(CHANGE_RECEIPT_LABEL)} ${formatReceiptMoney(receiptChange.changeDue)} ***</div>`);
+  }
 
   lines.push('<hr>');
   lines.push('<div style="text-align: center;">OBRIGADO!</div>');
