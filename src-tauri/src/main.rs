@@ -325,22 +325,18 @@ fn print_receipt_graphic(
     }
 }
 
-/// Test printer connection — usa o MESMO caminho da impressão real (RAW primeiro),
-/// para o teste refletir de fato o que acontece ao imprimir uma comanda.
-#[tauri::command]
-fn test_printer(printer_name: Option<String>) -> Result<(), String> {
-    let test_content = "\
-================================
-       TESTE DE IMPRESSAO
-================================
-KyberFood Impressora
-Impressora funcionando!
-================================
-"
-    .to_string();
-
-    print_receipt(printer_name, test_content, Some(32), Some(9.0))
-}
+// O COMANDO `test_printer` SAIU DAQUI, e ele era um SEGUNDO montador de comanda.
+//
+// Ele mandava quatro linhas fixas ("TESTE DE IMPRESSAO / Impressora funcionando!") — texto
+// que nenhuma comanda de verdade usa, na largura 32 e na fonte 9 cravadas no código, ou seja
+// ignorando o papel e a fonte que o lojista configurou no painel. Provava que a impressora
+// respondia e não provava nada sobre a comanda que ela ia imprimir.
+//
+// Hoje o teste é um PEDIDO SIMULADO montado no front (`src/test-order.ts`) e impresso pelo
+// MESMO `printOrder` da comanda automática: mesma largura, mesma fonte, mesmo modo gráfico.
+// Não reintroduza um caminho de teste próprio aqui — dois códigos para o mesmo documento
+// divergem sempre, e o modo de falhar é o teste passar enquanto a comanda de verdade sai
+// errada.
 
 use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
@@ -583,7 +579,6 @@ fn main() {
             get_printers,
             print_receipt,
             print_receipt_graphic,
-            test_printer,
             renderer_alive,
             read_device_state,
             write_device_state

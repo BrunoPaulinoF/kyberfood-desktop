@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient, RealtimeChannel, processLock } from '@supabase/supabase-js';
+import { buildTestOrder, type TestOrderProduct } from './test-order';
 import { 
   Bell, 
   Printer, 
@@ -16,7 +17,9 @@ import {
   RefreshCw,
   Download,
   LogOut,
-  CheckCircle2
+  CheckCircle2,
+  AlertTriangle,
+  Loader2
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/tauri';
 import {
@@ -1819,14 +1822,36 @@ function App() {
   // Devolve `true` só quando a comanda foi ACEITA pelo spooler. Quem chama usa isso para
   // decidir se marca o pedido como impresso — falso significa "tente de novo", e é o que
   // impede uma falha momentânea de virar comanda perdida.
-  const printOrder = async (order: Order, options?: { copies?: number }): Promise<boolean> => {
+  /**
+   * Imprime a comanda de um pedido.
+   *
+   * `silent` (comanda de TESTE): quem chamou mostra o resultado por conta própria, então o
+   * banner global e a notificação do sistema ficam de fora. Não é enfeite — são dois motivos:
+   * o pedido de teste tem id FIXO, e `notifyPrintFailure` deduplica por id num Set de módulo,
+   * de modo que a primeira falha do teste emudeceria todas as seguintes (justamente as que o
+   * lojista faz DEPOIS de mexer na impressora); e um teste bem-sucedido apagaria o aviso de
+   * uma comanda REAL que não saiu, escondendo do balcão o pedido que ficou sem papel.
+   */
+  const printOrder = async (
+    order: Order,
+    options?: { copies?: number; silent?: boolean; printerName?: string },
+  ): Promise<boolean> => {
     // Sem impressora configurada não há para onde imprimir: o app vive na
     // bandeja, então o diálogo do window.open(...).print() nunca seria visto.
     // Mostra um aviso e deixa o pedido disponível para reimpressão manual.
-    const printerName = settingsRef.current.selectedPrinter;
+    // `printerName` explícito é a impressora que quem chamou ACABOU de escolher: o teste sai
+    // do seletor de Configurações, e `settingsRef` só é atualizado no render seguinte ao
+    // `setSettings` — sem isso o teste imprimiria na impressora ANTERIOR e o lojista
+    // concluiria que a nova não funciona. Sem ele vale a configurada, o caminho de sempre.
+    const printerName = options?.printerName || settingsRef.current.selectedPrinter;
+    const silencioso = options?.silent === true;
+    const avisaFalha = (banner: string, motivo: string) => {
+      if (silencioso) return;
+      setPrintError(banner);
+      notifyPrintFailure(order, motivo);
+    };
     if (!printerName) {
-      setPrintError('Nenhuma impressora configurada — abra Configurações');
-      notifyPrintFailure(order, 'Nenhuma impressora configurada');
+      avisaFalha('Nenhuma impressora configurada — abra Configurações', 'Nenhuma impressora configurada');
       return false;
     }
     // REIMPRESSÃO SAI SEMPRE EM UMA VIA (decisão de produto): quem aperta o botão quer uma
@@ -1876,8 +1901,10 @@ function App() {
           // 10s e imprime só o que falta, até o pedido ter todas as vias.
           console.error(`Erro ao imprimir a ${via}a via:`, err);
           printedViasRef.current.set(order.id, via - 1);
-          setPrintError(`A ${via}ª via do pedido ${orderDisplayNumber(order)} não saiu — verifique a impressora`);
-          notifyPrintFailure(order, `A ${via}ª via não saiu na impressora "${printerName}"`);
+          avisaFalha(
+            `A ${via}ª via do pedido ${orderDisplayNumber(order)} não saiu — verifique a impressora`,
+            `A ${via}ª via não saiu na impressora "${printerName}"`,
+          );
           return false;
         }
         if (!reimpressao) printedViasRef.current.set(order.id, via);
@@ -1890,17 +1917,23 @@ function App() {
       // via de cortesia jogaria fora o "a via 1 já saiu" de uma comanda automática que parou
       // no meio, e a retentativa do polling mandaria a via 1 de novo para a cozinha.
       if (!reimpressao) printedViasRef.current.delete(order.id);
-      setPrintError(null);
+      if (!silencioso) setPrintError(null);
       console.log('Order printed successfully');
       return true;
     } catch (err) {
       console.error('Error printing order:', err);
-      setPrintError(`Falha ao imprimir na impressora "${printerName}" — verifique a impressora e reimprima`);
-      notifyPrintFailure(order, `Impressora "${printerName}" não respondeu`);
-      // Fallback to browser printing if it fails
-      const receiptHtml = generateReceiptHtml(order, store!);
-      const printWindow = window.open('', '_blank', 'width=400,height=600');
-      if (printWindow) {
+      avisaFalha(
+        `Falha ao imprimir na impressora "${printerName}" — verifique a impressora e reimprima`,
+        `Impressora "${printerName}" não respondeu`,
+      );
+      // Fallback to browser printing if it fails.
+      //
+      // FORA DO TESTE: no teste quem clicou está OLHANDO a tela e recebe a falha escrita ali.
+      // Uma janela de impressão do navegador surgindo por cima do modal responderia outra
+      // pergunta (a do navegador), e ainda faria o lojista achar que o teste funcionou.
+      const receiptHtml = silencioso ? null : generateReceiptHtml(order, store!);
+      const printWindow = receiptHtml ? window.open('', '_blank', 'width=400,height=600') : null;
+      if (printWindow && receiptHtml) {
         printWindow.document.write(receiptHtml);
         printWindow.document.close();
         printWindow.print();
@@ -2036,6 +2069,66 @@ function App() {
 
   // Mantém o ref de impressão apontando para o printOrder atual, para o polling
   // (memoizado) imprimir sempre com as configurações/loja mais recentes.
+  /**
+   * COMANDA DE TESTE — o botão de Configurações.
+   *
+   * Monta um pedido SIMULADO com os produtos REAIS do cardápio desta loja e o imprime pelo
+   * MESMO `printOrder` da comanda automática. Ver `test-order.ts` para o porquê de o teste
+   * ser um pedido inteiro em vez de quatro linhas de texto.
+   *
+   * O CARDÁPIO É LIDO NO CLIQUE, nunca junto do resto: esta consulta não existe no caminho
+   * normal do app (que só lê pedidos e a loja), e carregá-la na abertura seria custo
+   * recorrente por uma tela que quase ninguém abre.
+   *
+   * FALHAR AO LER O CARDÁPIO NÃO CANCELA O TESTE: `buildTestOrder` cai num cardápio de
+   * reserva. Quem clicou quer saber se a impressora responde — trocar essa resposta por "não
+   * consegui ler seu cardápio" seria devolver um problema que não é o dele.
+   *
+   * Devolve a mensagem a mostrar na tela: `ok` diz o que saiu no papel (é assim que ele sabe
+   * o que procurar), o erro diz o que conferir.
+   */
+  const printTestReceipt = async (printerName: string): Promise<{ ok: boolean; message: string }> => {
+    if (!store) return { ok: false, message: 'Nenhuma loja carregada — faça login novamente.' };
+    if (!printerName) {
+      return { ok: false, message: 'Escolha uma impressora na lista acima antes de testar.' };
+    }
+
+    let products: TestOrderProduct[] = [];
+    try {
+      const { data, error } = await supabase
+        .from('products')
+        // Mesmo recorte de colunas do cardápio da venda: nome, preço, tamanhos e complementos.
+        // Só o que estiver À VENDA entra — testar com item pausado ou na lixeira imprimiria
+        // uma comanda que a loja não consegue produzir.
+        .select('name, price, product_config, complements')
+        .eq('store_id', store.id)
+        .eq('is_active', true)
+        .eq('is_available', true)
+        .is('deleted_at', null)
+        .limit(40);
+      if (error) throw error;
+      products = (data as TestOrderProduct[]) || [];
+    } catch (err) {
+      console.warn('Nao consegui ler o cardapio para a comanda de teste:', err);
+    }
+
+    const testOrder = buildTestOrder(products, new Date());
+    // UMA VIA e SILENCIOSO: quem aperta o botão quer uma folha na mão, e o resultado é escrito
+    // aqui na tela — o banner global e a notificação do sistema são da comanda de VERDADE.
+    const ok = await printOrder(testOrder as unknown as Order, { copies: 1, silent: true, printerName });
+    if (!ok) {
+      return {
+        ok: false,
+        message: `Não consegui imprimir em "${printerName}". Confira se ela está ligada, com papel e selecionada acima.`,
+      };
+    }
+    const nomes = testOrder.items.map((item) => item.product_name).join(', ');
+    return {
+      ok: true,
+      message: `Comanda de teste enviada para "${printerName}". Confira no papel: pedido #${testOrder.order_number}, ${nomes}. Ela sai marcada como TESTE — não produza.`,
+    };
+  };
+
   useEffect(() => { printOrderRef.current = printOrder; });
   useEffect(() => { markReceiptPrintedRef.current = markReceiptPrinted; });
   useEffect(() => { reprintReceiptRef.current = reprintReceipt; });
@@ -2695,6 +2788,7 @@ function App() {
           onClose={() => setShowSettings(false)}
           onSave={setSettings}
           onLogout={() => setConfirmLogout(true)}
+          onTestPrint={printTestReceipt}
         />
       )}
 
@@ -3275,36 +3369,68 @@ function SettingsModal({
   onClose,
   onSave,
   onLogout,
+  onTestPrint,
 }: {
   settings: Settings;
   store: Store;
   onClose: () => void;
   onSave: (settings: Settings) => void;
   onLogout: () => void;
+  /** Imprime a comanda de TESTE e devolve o que mostrar na tela. Ver `printTestReceipt`. */
+  onTestPrint: (printerName: string) => Promise<{ ok: boolean; message: string }>;
 }) {
   const [localSettings, setLocalSettings] = useState(settings);
   const [systemPrinters, setSystemPrinters] = useState<{name: string, is_default: boolean}[]>([]);
   const [loadingPrinters, setLoadingPrinters] = useState(false);
+  // Estado do TESTE, separado do carregamento da lista de impressoras. Eram um só: o botão
+  // era um ícone de recarregar que girava enquanto a LISTA carregava, então clicar em
+  // "testar" não mudava nada na tela e o giro parecia ser da impressão — daí a queixa de que
+  // ele "fica rodando" sem dizer nada. Aqui cada coisa tem o seu.
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
-  useEffect(() => {
-    const fetchPrinters = async () => {
-      setLoadingPrinters(true);
-      try {
-        const printers = await invoke('get_printers') as any[];
-        setSystemPrinters(printers);
-        // If no printer selected yet, use default
-        if (!localSettings.selectedPrinter && printers.length > 0) {
-          const def = printers.find(p => p.is_default) || printers[0];
-          setLocalSettings(s => ({ ...s, selectedPrinter: def.name }));
-        }
-      } catch (err) {
-        console.error('Error fetching printers:', err);
-      } finally {
-        setLoadingPrinters(false);
-      }
-    };
-    fetchPrinters();
+  const fetchPrinters = useCallback(async () => {
+    setLoadingPrinters(true);
+    try {
+      const printers = await invoke('get_printers') as any[];
+      setSystemPrinters(printers);
+      // Escolha do lojista SEMPRE vence: só cai na padrão do Windows quando a que está
+      // selecionada não existe mais (ou não há nenhuma). Sem isso, o botão de atualizar a
+      // lista trocaria a impressora que ele acabou de escolher.
+      setLocalSettings(prev => {
+        if (printers.some(p => p.name === prev.selectedPrinter)) return prev;
+        const def = printers.find(p => p.is_default) || printers[0];
+        return def ? { ...prev, selectedPrinter: def.name } : prev;
+      });
+    } catch (err) {
+      console.error('Error fetching printers:', err);
+    } finally {
+      setLoadingPrinters(false);
+    }
   }, []);
+
+  useEffect(() => { void fetchPrinters(); }, [fetchPrinters]);
+
+  const handleTestPrint = async () => {
+    if (testing) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      // SÓ A IMPRESSORA É SALVA, nunca `localSettings` inteiro: o modal tem um "Salvar
+      // Alterações" próprio, e persistir som e auto-impressão por causa de um clique em
+      // testar guardaria uma escolha que o lojista ainda estava fazendo — e que ele desfaria
+      // fechando no X. Testar uma impressora É escolhê-la; o resto continua dele.
+      onSave({ ...settings, selectedPrinter: localSettings.selectedPrinter });
+      // A impressora também VIAJA explícita: `settingsRef` do App só é atualizado no render
+      // seguinte ao `onSave`, então confiar nele aqui imprimiria na impressora anterior.
+      setTestResult(await onTestPrint(localSettings.selectedPrinter));
+    } catch (err) {
+      console.error('Erro no teste de impressao:', err);
+      setTestResult({ ok: false, message: 'Não consegui falar com a impressora. Tente de novo.' });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -3365,7 +3491,13 @@ function SettingsModal({
             <div className="flex gap-2">
               <select
                 value={localSettings.selectedPrinter}
-                onChange={(e) => setLocalSettings(s => ({ ...s, selectedPrinter: e.target.value }))}
+                onChange={(e) => {
+                  const selectedPrinter = e.target.value;
+                  setLocalSettings(s => ({ ...s, selectedPrinter }));
+                  // O resultado do teste é de UMA impressora: mantê-lo na tela depois da troca
+                  // faria o lojista ler "funcionou" sobre a impressora que ele acabou de deixar.
+                  setTestResult(null);
+                }}
                 className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white focus:border-orange-500 focus:outline-none"
                 disabled={loadingPrinters}
               >
@@ -3374,16 +3506,66 @@ function SettingsModal({
                   <option key={p.name} value={p.name}>{p.name}{p.is_default ? ' (Padrão)' : ''}</option>
                 ))}
               </select>
-              <button 
-                onClick={() => invoke('test_printer', { printerName: localSettings.selectedPrinter || null })}
-                className="bg-gray-700 hover:bg-gray-600 p-2 rounded-lg border border-gray-600"
-                title="Imprimir Teste"
+              {/* Atualizar a LISTA e TESTAR viraram dois controles. Eram um só — um ícone de
+                  recarregar que girava enquanto a lista carregava —, e por isso clicar nele
+                  não dizia nada e o giro parecia ser o da impressão. */}
+              <button
+                type="button"
+                onClick={() => void fetchPrinters()}
+                disabled={loadingPrinters}
+                className="bg-gray-700 hover:bg-gray-600 p-2 rounded-lg border border-gray-600 disabled:opacity-50"
+                title="Atualizar a lista de impressoras do Windows"
               >
                 <RefreshCw className={`w-5 h-5 ${loadingPrinters ? 'animate-spin' : ''}`} />
               </button>
             </div>
             {systemPrinters.length === 0 && !loadingPrinters && (
               <p className="text-xs text-red-400 mt-1">Nenhuma impressora encontrada no Windows.</p>
+            )}
+
+            {/* O TESTE. Botão de largura inteira e com o que ele faz ESCRITO: o ícone sozinho
+                não dizia que aquilo imprimia, e o lojista descobria clicando. */}
+            <button
+              type="button"
+              onClick={handleTestPrint}
+              disabled={testing || !localSettings.selectedPrinter}
+              className="w-full mt-3 flex items-center justify-center gap-2 bg-orange-600 hover:bg-orange-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white font-semibold px-4 py-2.5 rounded-lg transition-colors"
+            >
+              {testing ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Imprimindo a comanda de teste...
+                </>
+              ) : (
+                <>
+                  <Printer className="w-5 h-5" />
+                  Imprimir comanda de teste
+                </>
+              )}
+            </button>
+            <p className="text-xs text-gray-400 mt-2">
+              Sai um <span className="text-gray-300 font-medium">pedido de mentira</span> com produtos do
+              seu cardápio, para você conferir no papel se a comanda está do jeito que precisa.
+              Ela vem marcada como <span className="text-gray-300 font-medium">TESTE</span> — não produza.
+            </p>
+
+            {/* O RESULTADO NA TELA é o que faltava: antes o clique não dizia se saiu papel,
+                e sem impressora respondendo não havia nada a olhar além da bandeja. */}
+            {testResult && (
+              <div
+                className={`mt-3 flex items-start gap-2 rounded-lg border px-3 py-2 text-sm ${
+                  testResult.ok
+                    ? 'border-green-600/50 bg-green-900/30 text-green-200'
+                    : 'border-red-600/50 bg-red-900/30 text-red-200'
+                }`}
+              >
+                {testResult.ok ? (
+                  <CheckCircle2 className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                ) : (
+                  <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                )}
+                <span>{testResult.message}</span>
+              </div>
             )}
           </div>
 
@@ -3501,7 +3683,13 @@ function stripControlChars(value: unknown): string {
   return out;
 }
 
-// Quebra um texto livre (observação escrita pelo cliente) em linhas que cabem no papel.
+// Marca de CONTINUAÇÃO de uma linha quebrada — TRAVA ANTI-FORJA, não estética: com recuo só
+// de espaços, um texto do PEDIDO calibrado no comprimento certo solta `   STATUS: PAGO` como
+// se fosse linha do sistema. ESPELHA RECEIPT_CONTINUATION_PREFIX de
+// src/lib/desktop-print-config.ts (projetos separados, não há import entre eles).
+const RECEIPT_CONTINUATION_PREFIX = '  > ';
+
+// Quebra um texto em linhas que cabem no papel.
 // ESPELHA wrapText de src/lib/desktop-print-config.ts.
 function wrapText(text: string, width: number, firstPrefix = '', contPrefix = firstPrefix): string[] {
   const words = String(text).trim().split(/\s+/).filter(Boolean);
@@ -3510,17 +3698,25 @@ function wrapText(text: string, width: number, firstPrefix = '', contPrefix = fi
   const out: string[] = [];
   let prefix = firstPrefix;
   let current = '';
+  const empurra = () => {
+    out.push(prefix + current);
+    prefix = contPrefix;
+    current = '';
+  };
   for (const word of words) {
-    const candidate = current ? `${current} ${word}` : word;
-    if (current && (prefix + candidate).length > width) {
-      out.push(prefix + current);
+    let resto = word;
+    if (current && (prefix + current + ' ' + resto).length > width) empurra();
+    // Palavra que sozinha não cabe é partida na força: sem isso ela estoura a coluna, e no
+    // texto CENTRALIZADO seria pior — `center` CORTA o que passa da largura.
+    while (!current && (prefix + resto).length > width && width - prefix.length > 1) {
+      const cabe = width - prefix.length;
+      out.push(prefix + resto.slice(0, cabe));
       prefix = contPrefix;
-      current = word;
-    } else {
-      current = candidate;
+      resto = resto.slice(cabe);
     }
+    current = current ? `${current} ${resto}` : resto;
   }
-  out.push(prefix + current);
+  if (current) out.push(prefix + current);
   return out;
 }
 
@@ -3529,10 +3725,11 @@ function wrapText(text: string, width: number, firstPrefix = '', contPrefix = fi
 // GRÁFICO o manda ao Rust, que o desenha como imagem (src-tauri/src/receipt_raster.rs).
 // ESPELHA ReceiptBlock de src/lib/desktop-print-config.ts e Block do receipt_raster.rs.
 type ReceiptBlock =
-  // `wrap`: quebra em várias linhas no modo TEXTO. Só observação e endereço da loja; texto
-  // do CLIENTE (nome) fica numa linha só — quebrado, um nome forjado criaria uma linha
-  // "STATUS: PAGO" solta (trava anti-forja do web, sanitize-text.test.ts).
-  | { kind: 'text'; text: string; align?: 'left' | 'center' | 'right'; strong?: boolean; big?: boolean; indent?: number; wrap?: boolean }
+  // TODO texto é quebrado no modo TEXTO, como o modo GRÁFICO sempre fez (o Rust quebra tudo e
+  // nem conhece a flag `wrap` que existia aqui). Quem impede um nome/endereço/observação
+  // forjado de virar uma linha "STATUS: PAGO" é RECEIPT_CONTINUATION_PREFIX, não a ausência
+  // de quebra — ver sanitize-text.test.ts no monorepo.
+  | { kind: 'text'; text: string; align?: 'left' | 'center' | 'right'; strong?: boolean; big?: boolean; indent?: number }
   | { kind: 'row'; left: string; right: string; strong?: boolean; indent?: number }
   | { kind: 'rule'; double?: boolean }
   | { kind: 'space' };
@@ -3562,7 +3759,12 @@ function layoutToLines(blocks: ReceiptBlock[], width: number): ReceiptLine[] {
       case 'text': {
         const emphasis = Boolean(block.strong || block.big);
         const prefix = INDENT_TEXT.repeat(block.indent || 0);
-        const wrapped = block.wrap ? wrapText(block.text, width, prefix, prefix + '   ') : [prefix + block.text];
+        // A MARCA SÓ VALE NO ALINHAMENTO À ESQUERDA, e é onde ela protege: título centralizado
+        // vem do CADASTRO DA LOJA (nome, endereço, rodapé), não do pedido — ali não há forja a
+        // impedir, e um "> " no meio de um nome centralizado só suja o cabeçalho. Mesma regra do
+        // raster, que só aplica o recuo de continuação quando `align == Left`.
+        const contPrefix = !block.align || block.align === 'left' ? prefix + RECEIPT_CONTINUATION_PREFIX : prefix;
+        const wrapped = wrapText(block.text, width, prefix, contPrefix);
         if (wrapped.length === 0) wrapped.push('');
         for (const raw of wrapped) {
           const text = block.align === 'center' ? center(raw.trim()) : block.align === 'right' ? rightAlign(raw.trim()) : raw;
@@ -3579,7 +3781,7 @@ function layoutToLines(blocks: ReceiptBlock[], width: number): ReceiptLine[] {
         if (left.length + right.length + 1 <= width) {
           lines.push(mark(`${left}${' '.repeat(width - left.length - right.length)}${right}`));
         } else {
-          wrapText(block.left, width, prefix, prefix + '   ').forEach((l) => lines.push(mark(l)));
+          wrapText(block.left, width, prefix, prefix + RECEIPT_CONTINUATION_PREFIX).forEach((l) => lines.push(mark(l)));
           lines.push(mark(rightAlign(right)));
         }
         break;
@@ -3609,7 +3811,7 @@ function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): Re
   const money = formatReceiptMoney;
 
   text({ text: store.name.toUpperCase(), align: 'center', strong: true });
-  if (config.showStoreAddress && store.address) text({ text: store.address, align: 'center', wrap: true });
+  if (config.showStoreAddress && store.address) text({ text: store.address, align: 'center' });
   rule(true);
   // TIPO DO PEDIDO, EM CIMA E EM DESTAQUE. Antes a retirada só aparecia no MEIO da ficha,
   // no lugar do endereço, e a entrega não aparecia em lugar nenhum.
@@ -3654,14 +3856,14 @@ function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): Re
       }
     });
     // Observação do ITEM em destaque, colada no produto a que pertence.
-    if (config.showItemNotes && item.notes) text({ text: `${ITEM_NOTE_RECEIPT_PREFIX.trim()} ${item.notes}`, indent: 1, strong: true, wrap: true });
+    if (config.showItemNotes && item.notes) text({ text: `${ITEM_NOTE_RECEIPT_PREFIX.trim()} ${item.notes}`, indent: 1, strong: true });
   });
 
   // OBSERVAÇÃO DO PEDIDO logo abaixo dos ITENS e em destaque: é instrução de PRODUÇÃO.
   if (config.showOrderNotes && order.notes) {
     rule();
     text({ text: ORDER_NOTES_RECEIPT_LABEL, strong: true });
-    text({ text: String(order.notes), strong: true, wrap: true });
+    text({ text: String(order.notes), strong: true });
   }
 
   rule();
@@ -3678,7 +3880,7 @@ function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): Re
   rule(true);
 
   if (config.showPayment && (order.payment_method || order.metadata?.saipos?.payment_types?.length)) {
-    text({ text: `PAGAMENTO: ${formatOrderPayments(order)}`, strong: true, wrap: true });
+    text({ text: `PAGAMENTO: ${formatOrderPayments(order)}`, strong: true });
     // TROCO A DEVOLVER em linha PRÓPRIA e em destaque: a linha de pagamento sempre disse
     // para quanto o cliente pede troco e nunca disse o troco, e a conta ficava para quem
     // monta a sacola fazer de cabeça.
