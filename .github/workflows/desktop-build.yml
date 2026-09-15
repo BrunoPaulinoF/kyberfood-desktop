@@ -39,11 +39,25 @@ jobs:
       - name: Resolver versão do build
         id: version
         shell: bash
+        # `${{ ... }}` é interpolado NO TEXTO do `run:` antes de o bash existir, então um valor
+        # com aspas ou `$(...)` vira COMANDO, não argumento. Aqui isso vale a chave que ASSINA
+        # a atualização de todas as lojas: este job tem `contents: write` e, no mesmo job,
+        # TAURI_PRIVATE_KEY e TAURI_KEY_PASSWORD. Entrada digitada por gente vem por `env:`,
+        # que o runner entrega como variável de ambiente — ali o conteúdo é DADO, nunca código.
+        # `github.ref_type`, `github.repository` e `github.run_number` não são digitáveis por
+        # ninguém e ficam como estão.
+        env:
+          VERSAO_INFORMADA: ${{ github.event.inputs.version }}
         run: |
           set -e
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            # Disparo manual com versão explícita: respeita o que o usuário informou.
-            V="${{ github.event.inputs.version }}"
+          if [ -n "$VERSAO_INFORMADA" ]; then
+            # Disparo manual com versão explícita: respeita o que o usuário informou, depois de
+            # conferir o FORMATO — o valor vira nome de arquivo, tag e conteúdo do latest.json.
+            if ! echo "$VERSAO_INFORMADA" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Versão inválida: '$VERSAO_INFORMADA'. Use o formato 1.2.3." >&2
+              exit 1
+            fi
+            V="$VERSAO_INFORMADA"
           elif [ "${{ github.ref_type }}" = "tag" ]; then
             # Tag desktop-v*: usa a versão da própria tag.
             V="${GITHUB_REF_NAME#desktop-v}"
@@ -93,11 +107,16 @@ jobs:
         # Injeta a versão resolvida em package.json e tauri.conf.json para que o
         # instalador e o latest.json fiquem consistentes.
         shell: bash
+        # A versão chega por `env:` (dado, não código) e o Node a lê de `process.env`, em vez
+        # de ela ser concatenada DENTRO de uma string de JavaScript — onde uma aspa fecharia o
+        # literal e o resto viraria código rodando no runner. É o mesmo desenho que o passo do
+        # `latest.json`, mais abaixo, já usava.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -e
-          V="${{ steps.version.outputs.version }}"
-          node -e "const fs=require('fs');const p='package.json';const j=JSON.parse(fs.readFileSync(p));j.version='$V';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
-          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p));j.package.version='$V';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+          node -e "const fs=require('fs');const p='package.json';const j=JSON.parse(fs.readFileSync(p));j.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p));j.package.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
 
       - name: Ligar o updater (só com chave de assinatura configurada)
         # O updater do Tauri EXIGE a chave pública no tauri.conf.json e a privada no build:
@@ -136,7 +155,10 @@ jobs:
         # vazios e o app usa os fallbacks — o build funciona do mesmo jeito.
         shell: bash
         run: |
-          cat > .env <<EOF
+          # Heredoc CITADO (`<<'EOF'`): o Actions já substituiu o `${{ ... }}` no texto antes de
+          # o bash rodar, então citar não atrapalha nada e impede o shell de expandir um `$` ou
+          # uma crase que o próprio segredo contenha — que geraria um `.env` errado em silêncio.
+          cat > .env <<'EOF'
           VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_API_URL=${{ secrets.VITE_API_URL }}
@@ -235,13 +257,21 @@ jobs:
         # O Tauri ignora os campos extras, então os dois convivem. Trocar um pelo outro
         # deixaria metade das lojas sem saber que existe versão nova.
         shell: bash
+        # Saída de step também entra por `env:`: a versão nasce da entrada manual, e a
+        # assinatura é conteúdo de um arquivo gerado no runner. Nenhuma das duas precisa
+        # atravessar o texto do `run:` para chegar ao node, que já as lê de `process.env`.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO_NAME: ${{ github.repository }}
+          BUNDLE_PRESENTE: ${{ steps.updater_bundle.outputs.has_bundle }}
+          BUNDLE_SIGNATURE: ${{ steps.updater_bundle.outputs.signature }}
         run: |
           set -e
-          V="${{ steps.version.outputs.version }}"
+          V="$VERSION"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          REPO="${{ github.repository }}"
-          HAS_BUNDLE="${{ steps.updater_bundle.outputs.has_bundle }}"
-          SIGNATURE="${{ steps.updater_bundle.outputs.signature }}"
+          REPO="$REPO_NAME"
+          HAS_BUNDLE="$BUNDLE_PRESENTE"
+          SIGNATURE="$BUNDLE_SIGNATURE"
 
           V="$V" PUB_DATE="$PUB_DATE" REPO="$REPO" HAS_BUNDLE="$HAS_BUNDLE" SIGNATURE="$SIGNATURE" node -e "
             const fs = require('fs');
