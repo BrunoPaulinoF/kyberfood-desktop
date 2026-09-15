@@ -39,8 +39,8 @@ jobs:
       - name: Resolver versão do build
         id: version
         shell: bash
-        # `${{ ... }}` é interpolado NO TEXTO do `run:` antes de o bash existir, então um valor
-        # com aspas ou `$(...)` vira COMANDO, não argumento. Aqui isso vale a chave que ASSINA
+        # A expressão do Actions é substituída NO TEXTO do `run:` antes de o bash existir,
+        # então um valor com aspas ou `$(...)` vira COMANDO, não argumento. Aqui isso vale a chave que ASSINA
         # a atualização de todas as lojas: este job tem `contents: write` e, no mesmo job,
         # TAURI_PRIVATE_KEY e TAURI_KEY_PASSWORD. Entrada digitada por gente vem por `env:`,
         # que o runner entrega como variável de ambiente — ali o conteúdo é DADO, nunca código.
@@ -155,9 +155,12 @@ jobs:
         # vazios e o app usa os fallbacks — o build funciona do mesmo jeito.
         shell: bash
         run: |
-          # Heredoc CITADO (`<<'EOF'`): o Actions já substituiu o `${{ ... }}` no texto antes de
-          # o bash rodar, então citar não atrapalha nada e impede o shell de expandir um `$` ou
-          # uma crase que o próprio segredo contenha — que geraria um `.env` errado em silêncio.
+          # Heredoc CITADO (`<<'EOF'`): o Actions já trocou a expressão pelo valor do segredo
+          # antes de o bash rodar, então citar não atrapalha nada e impede o shell de expandir
+          # um `$` ou uma crase que o próprio segredo contenha — que geraria um `.env` errado
+          # em silêncio. O comentário NÃO escreve a sintaxe de expressão do Actions: aqui
+          # dentro ele é texto do script, não comentário de YAML, e o Actions tentaria AVALIAR
+          # o que encontrasse — foi assim que este workflow parou de parsear em 15/09/2026.
           cat > .env <<'EOF'
           VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
