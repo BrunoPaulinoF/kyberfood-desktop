@@ -780,6 +780,56 @@ const AUTH_STORAGE_KEY = 'kyberfood.desktop.auth';
  */
 const HEARTBEAT_INTERVAL_MS = 30_000;
 
+/**
+ * FREIO DO RELOGIN AUTOMÁTICO — o teto que faltava no caminho de SUCESSO.
+ *
+ * INCIDENTE (15/09/2026, 10:32–10:52 UTC, a máquina do dono com a loja "KyberFood
+ * Teste"): em 20 minutos o app fez **231 logins com senha BEM-SUCEDIDOS** (~12 por
+ * minuto, um a cada 5s) e levou **477 respostas 429** do Supabase Auth. Parou de repente
+ * quando o app foi fechado; 230 das 266 sessões do projeto inteiro nasceram nessa janela.
+ *
+ * A BOLA DE NEVE: o refresh do token toma 429 -> `getAuthHeaders()` devolve um token
+ * vencido -> as chamadas voltam 401 -> relogin -> **dá certo**, sessão nova -> o 429
+ * continua -> 401 de novo, 5 segundos depois. Cada volta gasta mais uma chamada de auth
+ * e aproxima ainda mais do rate limit: quanto mais o app tentava se salvar, mais fundo
+ * afundava.
+ *
+ * O `attemptAutoRelogin` só tinha backoff no `catch` — ou seja, apenas quando o login
+ * FALHAVA. O laço observado nunca chegou lá, porque os logins davam 200.
+ *
+ * O freio NÃO pode virar desistência: a conta só sai pelo botão Sair (a Leley Sorvetes
+ * Tanabi passou dois dias sem comanda por causa de um clique lá). Por isso ele só ESPACA
+ * as tentativas, sem teto de quantidade — no pior caso o app tenta de 15 em 15 minutos,
+ * para sempre.
+ */
+const RELOGIN_MIN_INTERVAL_MS = 60_000;
+/** Teto da espera. Acima disso o app demoraria demais para voltar quando a rede voltar. */
+const RELOGIN_MAX_INTERVAL_MS = 15 * 60_000;
+/**
+ * Acima deste silêncio, o relogin anterior é dado como RESOLVIDO e a espera volta a zero.
+ * É o que separa "a sessão caiu de novo daqui a uma semana" (normal, relogar na hora) de
+ * "o relogin não resolveu e o 401 voltou em segundos" (o laço).
+ *
+ * ELE TEM QUE SER MAIOR QUE `RELOGIN_MAX_INTERVAL_MS`, e isso não é folga arbitrária: o
+ * silêncio só prova estabilidade quando o app estava OPERANDO nele. Se a espera máxima
+ * passasse daqui, o próprio adiamento zeraria o contador ao voltar — o app teria ficado
+ * "estável" só porque estava esperando —, o backoff nunca chegaria ao topo e voltaria a
+ * martelar do zero. O freio afrouxaria sozinho, em silêncio. Trava em
+ * `desktop-relogin-throttle.test.ts` ("o teto da espera é menor que o silêncio").
+ */
+const RELOGIN_STABLE_MS = 30 * 60_000;
+
+/**
+ * Quanto esperar antes do PRÓXIMO relogin, dado quantos já saíram em sequência sem que o
+ * app ficasse estável no meio. Zero na primeira vez: um 401 legítimo e isolado (sessão
+ * realmente expirada) continua sendo resolvido NA HORA, que é o que mantém o polling de
+ * pedidos de pé.
+ */
+function reloginBackoffMs(streak: number): number {
+  if (streak <= 0) return 0;
+  return Math.min(RELOGIN_MAX_INTERVAL_MS, RELOGIN_MIN_INTERVAL_MS * 2 ** (streak - 1));
+}
+
 type SavedCredentials = { email: string; password: string };
 
 function saveCredentials(credentials: SavedCredentials) {
@@ -1011,6 +1061,14 @@ function App() {
   const loggingOutRef = useRef(false);
   const reloginBusyRef = useRef(false);
   const reloginTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Instante do último relogin BEM-SUCEDIDO e quantos saíram em sequência sem o app
+  // ficar estável no meio. Juntos são o freio contra o laço de 15/09/2026 (ver
+  // RELOGIN_MIN_INTERVAL_MS): sem eles, um 401 persistente vira uma sessão nova a cada
+  // batida do polling, para sempre.
+  const lastReloginAtRef = useRef(0);
+  const reloginStreakRef = useRef(0);
+  // Espera em curso entre duas tentativas: liga o aviso de conexão instável na tela.
+  const [reloginWaiting, setReloginWaiting] = useState(false);
   const [appVersion, setAppVersion] = useState<string>('');
   // Refs para o handler de realtime sempre imprimir com os valores mais recentes
   // (o efeito de subscribe não re-roda a cada atualização de config/settings).
@@ -2239,15 +2297,44 @@ function App() {
     const credentials = loadCredentials();
     if (!credentials) return;
 
+    // FREIO (ver RELOGIN_MIN_INTERVAL_MS): quando o relogin ANTERIOR deu certo e o 401
+    // voltou assim mesmo, não adianta refazer na hora — foi isso que produziu 231 logins
+    // em 20 minutos. A tentativa é ADIADA, nunca descartada: descartar deixaria um 401
+    // legítimo sem resposta até a próxima batida do polling.
+    const espera = reloginBackoffMs(reloginStreakRef.current);
+    const desdeUltimo = Date.now() - lastReloginAtRef.current;
+    if (lastReloginAtRef.current && desdeUltimo < espera) {
+      // Um timer só: os quatro gatilhos (heartbeat, polling, sentinela e onAuthStateChange)
+      // disparam em paralelo, e um agendamento por gatilho recriaria o laço mais devagar.
+      if (!reloginTimerRef.current) {
+        setReloginWaiting(true);
+        reloginTimerRef.current = setTimeout(() => {
+          reloginTimerRef.current = null;
+          void attemptAutoRelogin(attempt);
+        }, espera - desdeUltimo);
+      }
+      return;
+    }
+
     reloginBusyRef.current = true;
     setReconnecting(true);
     try {
       const { data, error } = await supabase.auth.signInWithPassword(credentials);
       if (error) throw error;
       if (!data.session) throw new Error('sessão vazia');
+      // Relogin que resolveu de fato deixa o app quieto por mais que RELOGIN_STABLE_MS;
+      // o que não resolveu volta aqui em segundos, e é esse retorno rápido que faz a
+      // espera seguinte crescer (60s, 2min, 4min… até o teto de 15min).
+      const agora = Date.now();
+      reloginStreakRef.current =
+        lastReloginAtRef.current && agora - lastReloginAtRef.current < RELOGIN_STABLE_MS
+          ? reloginStreakRef.current + 1
+          : 0;
+      lastReloginAtRef.current = agora;
       // Daqui o onAuthStateChange assume: recarrega a loja e religa o realtime.
       setError(null);
       setReconnecting(false);
+      setReloginWaiting(false);
     } catch (err: any) {
       const message = String(err?.message || '').toLowerCase();
       const rejected =
@@ -2261,14 +2348,37 @@ function App() {
         // A senha guardada não vale mais; o e-mail continua preenchido na tela.
         forgetPrefillPassword();
         setReconnecting(false);
+        setReloginWaiting(false);
         setError('A senha salva não vale mais. Entre novamente para o app voltar a receber pedidos.');
         return;
       }
 
+      // 429 é o Supabase Auth dizendo "chega, espere" — repetir em 5s é exatamente o que
+      // alimenta o laço. Ele NÃO é recusa de credencial (a conta continua boa), então cai
+      // na mesma espera longa do freio em vez do backoff curto de falha de rede.
+      const rateLimited =
+        String(err?.status || '') === '429' ||
+        String(err?.code || '').includes('rate_limit') ||
+        message.includes('rate limit') ||
+        message.includes('rate_limit') ||
+        message.includes('too many requests');
+
       console.warn('Relogin automático falhou, vou tentar de novo:', err);
-      const delay = Math.min(60_000, 5_000 * 2 ** attempt);
+      const delay = rateLimited
+        ? Math.max(RELOGIN_MIN_INTERVAL_MS, reloginBackoffMs(reloginStreakRef.current))
+        : Math.min(60_000, 5_000 * 2 ** attempt);
+      if (rateLimited) {
+        // O 429 conta como tentativa gasta: sem isto, uma rajada de 429 manteria a espera
+        // no piso de 1 min para sempre, em vez de ir abrindo até os 15.
+        reloginStreakRef.current += 1;
+        lastReloginAtRef.current = Date.now();
+        setReloginWaiting(true);
+      }
       if (reloginTimerRef.current) clearTimeout(reloginTimerRef.current);
-      reloginTimerRef.current = setTimeout(() => { void attemptAutoRelogin(attempt + 1); }, delay);
+      reloginTimerRef.current = setTimeout(() => {
+        reloginTimerRef.current = null;
+        void attemptAutoRelogin(attempt + 1);
+      }, delay);
     } finally {
       reloginBusyRef.current = false;
     }
@@ -2385,6 +2495,12 @@ function App() {
         // volta é um clique em Entrar, não redigitar e-mail e senha no balcão.
         saveLoginPrefill({ email, password });
         loggingOutRef.current = false;
+        // Login DIGITADO por uma pessoa zera o freio do relogin automático: quem estava
+        // na frente da tela já resolveu o que o laço tentava resolver sozinho, e herdar
+        // uma espera de 15 min aqui deixaria o app parado depois de um login que deu certo.
+        reloginStreakRef.current = 0;
+        lastReloginAtRef.current = 0;
+        setReloginWaiting(false);
         setStore(storeData);
         setIsAuthenticated(true);
         setReconnecting(false);
@@ -2411,6 +2527,10 @@ function App() {
     }
     clearCredentials();
     setReconnecting(false);
+    // O próximo login (manual) começa sem espera herdada deste laço.
+    reloginStreakRef.current = 0;
+    lastReloginAtRef.current = 0;
+    setReloginWaiting(false);
     try {
       // ESCOPO LOCAL, NUNCA O PADRÃO (o mesmo cuidado do painel, em `useAuth.tsx`).
       // `signOut()` sem opções usa `scope: 'global'` e revoga TODAS as sessões da conta:
@@ -2481,6 +2601,14 @@ function App() {
           <span className="max-w-xs text-xs text-gray-500">
             A conexão caiu e o app está entrando de novo sozinho. Não precisa fazer nada.
           </span>
+          {/* Espera do freio: sem dizer isto, a tela fica girando por minutos e a equipe
+              acha que travou. O app NÃO desistiu — ele só parou de martelar. */}
+          {reloginWaiting && (
+            <span className="max-w-xs text-xs text-yellow-500">
+              A conexão está instável, então as tentativas foram espaçadas. O app continua
+              tentando sozinho — pode deixar aberto.
+            </span>
+          )}
         </div>
       </div>
     );
