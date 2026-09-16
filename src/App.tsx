@@ -192,7 +192,7 @@ function compareVersions(a: string, b: string): number {
 // ===== Configuração de impressão =====
 // Espelha src/lib/desktop-print-config.ts do app web. O lojista edita na página
 // de Integrações (com pré-visualização) e o desktop aplica na comanda.
-type PrintFontSize = 'small' | 'normal' | 'large';
+type PrintFontSize = 'small' | 'normal' | 'large' | 'xlarge';
 /**
  * COMO a comanda é desenhada: `printer` = modo TEXTO (a fonte da própria impressora, o de
  * sempre); `graphic` = modo GRÁFICO (o app desenha a comanda como imagem com uma fonte de
@@ -240,7 +240,7 @@ const DEFAULT_PRINT_CONFIG: PrintConfig = {
 };
 
 // Tamanho da fonte (em pt) enviado ao comando de impressão do Rust.
-const FONT_SIZE_PT: Record<PrintFontSize, number> = { small: 7, normal: 9, large: 12 };
+const FONT_SIZE_PT: Record<PrintFontSize, number> = { small: 7, normal: 9, large: 12, xlarge: 16 };
 
 /**
  * Idade máxima de um job de impressão vindo do painel que ainda vale imprimir.
@@ -270,7 +270,8 @@ function normalizePrintCopies(value: any): number {
 
 function normalizePrintConfig(value: any): PrintConfig {
   const raw = value && typeof value === 'object' ? value : {};
-  const fontSize: PrintFontSize = raw.fontSize === 'small' || raw.fontSize === 'large' ? raw.fontSize : 'normal';
+  const fontSize: PrintFontSize =
+    raw.fontSize === 'small' || raw.fontSize === 'large' || raw.fontSize === 'xlarge' ? raw.fontSize : 'normal';
   // Só o valor EXPLÍCITO liga o modo gráfico: config antiga (sem o campo) fica no texto.
   const fontStyle: PrintFontStyle = raw.fontStyle === 'graphic' ? 'graphic' : 'printer';
   // Padrão 80mm (48); só cai para 58mm quando a loja escolheu 32 explicitamente.

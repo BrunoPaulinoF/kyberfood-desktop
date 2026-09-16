@@ -127,10 +127,26 @@ fn build_escpos(content: &str, font_pt: f64) -> Vec<u8> {
     } else {
         bytes.extend_from_slice(&[0x1B, 0x4D, 0x00]); // ESC M 0 -> Fonte A (padrão)
     }
-    // Altura base: "grande" já sai em altura dupla. Guardamos o valor para RESTAURAR
-    // depois de cada linha em destaque — sem isso a comanda inteira herdaria o destaque.
-    let base_size: u8 = if font_pt >= 11.0 { 0x01 } else { 0x00 };
+    // Altura base: "grande" sai em altura DUPLA e "extragrande" em altura TRIPLA. Guardamos
+    // o valor para RESTAURAR depois de cada linha em destaque — sem isso a comanda inteira
+    // herdaria o destaque.
+    //
+    // Só a ALTURA cresce (nibble baixo do GS !); a largura fica em 1x nos três tamanhos,
+    // porque largura dupla mudaria a contagem de colunas e quebraria todo o alinhamento
+    // montado pelo front.
+    let base_size: u8 = if font_pt >= 15.0 {
+        0x02 // altura tripla
+    } else if font_pt >= 11.0 {
+        0x01 // altura dupla
+    } else {
+        0x00
+    };
     bytes.extend_from_slice(&[0x1D, 0x21, base_size]); // GS ! -> altura (largura normal)
+
+    // O DESTAQUE NUNCA PODE SAIR MENOR QUE O CORPO. Ele era um `GS ! 0x01` fixo, e em
+    // "extragrande" — onde o corpo já é altura tripla — isso ENCOLHERIA justamente a linha
+    // que a cozinha precisa enxergar de longe (o tipo do pedido, as observações).
+    let emphasis_size: u8 = if base_size > 0x01 { base_size } else { 0x01 };
 
     // Corpo: cada linha do texto vira bytes ASCII + avanço de linha (LF).
     // Linha prefixada por EMPHASIS_PREFIX sai em NEGRITO + ALTURA DUPLA: é o tipo do
@@ -141,7 +157,7 @@ fn build_escpos(content: &str, font_pt: f64) -> Vec<u8> {
         let (text, strong) = split_emphasis(line);
         if strong {
             bytes.extend_from_slice(&[0x1B, 0x45, 0x01]); // ESC E 1 -> negrito
-            bytes.extend_from_slice(&[0x1D, 0x21, 0x01]); // GS ! 0x01 -> altura dupla
+            bytes.extend_from_slice(&[0x1D, 0x21, emphasis_size]); // GS ! -> altura do destaque
         }
         bytes.extend_from_slice(&to_ascii_bytes(text));
         // O LF vai AINDA em altura dupla de propósito: é ele que reserva o espaço vertical

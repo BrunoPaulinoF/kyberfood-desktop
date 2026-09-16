@@ -230,10 +230,16 @@ impl<'a> Typesetter<'a> {
 }
 
 /// Tamanho base da fonte em pontos de impressora a partir do tamanho configurado no painel
-/// (7 = pequena, 9 = normal, 12 = grande — os mesmos valores do modo texto).
+/// (7 = pequena, 9 = normal, 12 = grande, 16 = extragrande — os mesmos valores do modo texto).
+///
+/// Aqui crescer é seguro: a largura do bitmap é a do PAPEL (`cols * DOTS_PER_COLUMN`) e o
+/// texto é quebrado por largura em PIXELS, então uma letra maior cabe menos por linha e a
+/// comanda fica mais comprida — nunca mais larga que o papel.
 fn base_px_for(font_pt: f64) -> f32 {
     if font_pt <= 7.5 {
         22.0
+    } else if font_pt >= 15.0 {
+        38.0
     } else if font_pt >= 11.0 {
         30.0
     } else {
