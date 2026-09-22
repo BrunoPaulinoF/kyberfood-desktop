@@ -3054,7 +3054,10 @@ function LogoutConfirmModal({
 }) {
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60] p-4">
-      <div className="bg-gray-800 rounded-2xl border border-gray-700 max-w-md w-full p-6">
+      {/* Mesmo teto de altura do modal de Configurações: sem ele, numa janela baixa o aviso
+          estoura a tela e o botão SEGURO ("Continuar conectado") fica fora do alcance —
+          justamente nesta janela, em que o clique errado deixa a loja sem comanda. */}
+      <div className="bg-gray-800 rounded-2xl border border-gray-700 max-w-md w-full p-6 max-h-[90vh] overflow-y-auto">
         <div className="flex items-start gap-3 mb-4">
           <div className="w-10 h-10 rounded-full bg-red-600/20 flex items-center justify-center shrink-0">
             <LogOut className="w-5 h-5 text-red-400" />
@@ -3562,11 +3565,17 @@ function SettingsModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-xl p-6 w-[450px]">
-        <h2 className="text-xl font-bold mb-6">Configurações</h2>
-        
-        <div className="space-y-6">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      {/* CABEÇALHO FIXO, CORPO ROLÁVEL, RODAPÉ FIXO. O painel não tinha teto de altura: numa
+          janela baixa o conteúdo estourava a tela para CIMA e para BAIXO, e com o overlay
+          centralizado não havia como rolar até ele — o "Salvar Alterações" ficava fora do
+          alcance. ESPELHA o padrão de src/components/ui/Modal.tsx no web (max-h + flex-col +
+          corpo com overflow-y-auto). Os botões ficam FORA da área que rola de propósito: são
+          o que a pessoa veio clicar, e rolar atrás deles é o defeito que isto conserta. */}
+      <div className="bg-gray-800 rounded-xl w-full max-w-[450px] max-h-[90vh] flex flex-col">
+        <h2 className="text-xl font-bold px-6 pt-6 pb-4 shrink-0">Configurações</h2>
+
+        <div className="space-y-6 flex-1 overflow-y-auto px-6 pb-6">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               {localSettings.soundEnabled ? (
@@ -3706,26 +3715,28 @@ function SettingsModal({
               são definidos no painel KyberFood, em <span className="text-gray-300 font-medium">Integrações → Configurar impressão</span>.
             </p>
           </div>
-        </div>
-        
-        {/* Conta conectada + logout. O login é persistente: fechar/reabrir o app
-            mantém a conta; o usuário só sai clicando aqui. */}
-        <div className="border-t border-gray-700 mt-6 pt-4 flex items-center justify-between">
-          <div className="text-sm">
-            <p className="text-gray-500 text-xs">Conta conectada</p>
-            <p className="text-gray-200 font-medium">{store.name}</p>
+
+          {/* Conta conectada + logout. O login é persistente: fechar/reabrir o app
+              mantém a conta; o usuário só sai clicando aqui. Fica DENTRO da área que rola:
+              a ação principal do modal é salvar, e o "Sair da conta" disputando o rodapé
+              fixo com ela poria o botão mais destrutivo do app ao lado do mais usado. */}
+          <div className="border-t border-gray-700 pt-4 flex items-center justify-between">
+            <div className="text-sm">
+              <p className="text-gray-500 text-xs">Conta conectada</p>
+              <p className="text-gray-200 font-medium">{store.name}</p>
+            </div>
+            <button
+              onClick={onLogout}
+              className="flex items-center gap-2 text-sm text-red-300 hover:text-red-200 border border-red-500/40 hover:border-red-500 px-3 py-2 rounded-lg"
+              title="Sair da conta"
+            >
+              <LogOut className="w-4 h-4" />
+              Sair da conta
+            </button>
           </div>
-          <button
-            onClick={onLogout}
-            className="flex items-center gap-2 text-sm text-red-300 hover:text-red-200 border border-red-500/40 hover:border-red-500 px-3 py-2 rounded-lg"
-            title="Sair da conta"
-          >
-            <LogOut className="w-4 h-4" />
-            Sair da conta
-          </button>
         </div>
 
-        <div className="flex gap-3 mt-6 pt-6 border-t border-gray-700">
+        <div className="flex gap-3 px-6 py-4 border-t border-gray-700 shrink-0">
           <button
             onClick={onClose}
             className="flex-1 bg-gray-700 hover:bg-gray-600 py-2.5 rounded-lg font-medium"
