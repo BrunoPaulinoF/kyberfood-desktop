@@ -665,6 +665,107 @@ function classifyReceiptPrint(
   return 'print';
 }
 
+// ===== POLLING DE PEDIDOS: só o que MUDOU =====
+//
+// O polling de 10s baixava a lista inteira dos últimos 50 pedidos, com os itens, a cada
+// volta, em toda loja com o app aberto — 24 horas por dia. Medido no estudo de custo do
+// Supabase (26/09/2026): era ~2/3 do tráfego de saída do KyberFood, e quase tudo era a
+// MESMA lista de novo. Agora o app guarda os pedidos em aberto e pede à API só o que mudou
+// desde a última resposta (`updatedSince`); a lista cheia continua vindo no arranque, a cada
+// ORDERS_FULL_RESYNC_MS e sempre que o delta não for confiável.
+//
+// A GARANTIA DA COMANDA NÃO MUDA: todos os pedidos em aberto continuam passando por
+// `processIncomingOrder` a cada volta, então a impressão que falhou é retentada como antes.
+// O que mudou é de onde vem a lista — da memória, atualizada pelo delta — e não o que se
+// faz com ela.
+
+/** Pedidos que o app acompanha: a fila da IA e os que estão na cozinha / na rua. */
+const ACTIVE_ORDER_STATUSES = ['ai_attention', 'confirmed', 'preparing', 'delivering'];
+
+/**
+ * De quanto em quanto tempo a lista inteira volta a ser pedida.
+ *
+ * O delta não enxerga pedido APAGADO nem o que eventualmente escapar do cursor; a lista
+ * cheia periódica é a rede que reconcilia a memória com o banco.
+ */
+const ORDERS_FULL_RESYNC_MS = 5 * 60_000;
+
+/**
+ * Folga do cursor. O `updated_at` do pedido é gravado com o relógio do INÍCIO da transação
+ * no banco, então uma mudança pode aparecer com um horário um pouco anterior à resposta que
+ * a antecedeu. Pedir de novo um minuto de mudanças já vistas é barato e inofensivo (o
+ * reprocessamento é idempotente); perder uma, não.
+ */
+const ORDERS_DELTA_OVERLAP_MS = 60_000;
+
+interface OrdersSyncState {
+  /** Loja a que este estado pertence: resposta de outra loja é descartada. */
+  storeId: string;
+  /** A partir de quando pedir mudanças. `null` = a próxima volta pede a lista inteira. */
+  cursor: string | null;
+  /** Quando a última lista inteira foi aplicada. */
+  lastFullAt: number;
+}
+
+interface OrdersPollResponse {
+  orders?: Order[];
+  serverTime?: string;
+  delta?: boolean;
+  deltaLimit?: number;
+}
+
+/**
+ * O pedaço da URL que decide lista inteira × só o que mudou.
+ *
+ * Sem cursor, ou com a lista inteira velha, volta a pedir tudo — é isso que reconcilia a
+ * memória com o banco de tempos em tempos.
+ */
+function ordersSyncQuery(state: OrdersSyncState, now: number): string {
+  if (!state.cursor) return '';
+  if (now - state.lastFullAt >= ORDERS_FULL_RESYNC_MS) return '';
+  return `&updatedSince=${encodeURIComponent(state.cursor)}`;
+}
+
+/**
+ * Aplica uma resposta do polling à memória de pedidos em aberto.
+ *
+ * - Resposta SEM `delta: true` é SEMPRE uma lista inteira — inclusive a do servidor antigo,
+ *   que ignora o `updatedSince`: a memória é reconstruída do zero, como era antes.
+ * - Delta MESCLA: pedido em aberto entra/atualiza, pedido que saiu dos estados em aberto
+ *   (concluído, cancelado) sai da memória.
+ * - Delta que veio no teto (`deltaLimit`) pode ter deixado mudança para trás: ele é aplicado
+ *   (cada linha é o estado atual do pedido) e o cursor é zerado, para a próxima volta pedir
+ *   a lista inteira.
+ * - Sem `serverTime` (servidor antigo) o cursor também fica nulo: o app continua pedindo a
+ *   lista inteira, exatamente como fazia.
+ */
+function applyOrdersPoll(
+  active: Map<string, Order>,
+  state: OrdersSyncState,
+  data: OrdersPollResponse,
+  now: number,
+): { active: Map<string, Order>; state: OrdersSyncState } {
+  const orders = Array.isArray(data.orders) ? data.orders : [];
+  const isDelta = data.delta === true;
+  const next = isDelta ? new Map(active) : new Map<string, Order>();
+  for (const order of orders) {
+    if (!order?.id) continue;
+    if (ACTIVE_ORDER_STATUSES.includes(order.status)) next.set(order.id, order);
+    else next.delete(order.id);
+  }
+
+  const serverMs = typeof data.serverTime === 'string' ? Date.parse(data.serverTime) : NaN;
+  const truncated = isDelta && typeof data.deltaLimit === 'number' && orders.length >= data.deltaLimit;
+  const cursor = Number.isFinite(serverMs) && !truncated
+    ? new Date(serverMs - ORDERS_DELTA_OVERLAP_MS).toISOString()
+    : null;
+
+  return {
+    active: next,
+    state: { storeId: state.storeId, cursor, lastFullAt: isDelta ? state.lastFullAt : now },
+  };
+}
+
 /**
  * Comanda que ficou pendente tempo demais NÃO sai calada.
  *
@@ -1112,6 +1213,12 @@ function App() {
   // impressa" e nunca sairia (ver o bloco da fila da comanda).
   const baselineDoneRef = useRef(false);
   /**
+   * Pedidos em aberto que o polling conhece, mantidos pelo delta (ver o bloco "POLLING DE
+   * PEDIDOS: só o que MUDOU"), e o cursor de onde pedir as próximas mudanças.
+   */
+  const activeOrdersRef = useRef<Map<string, Order>>(new Map());
+  const ordersSyncRef = useRef<OrdersSyncState>({ storeId: '', cursor: null, lastFullAt: 0 });
+  /**
    * Contexto da fila de comandas: a loja e desde quando ESTA instalação a mantém.
    *
    * Vive num ref porque `processIncomingOrder` é memoizado com deps vazias (para o polling
@@ -1507,7 +1614,17 @@ function App() {
       // reiniciou entre 19:44 e 19:47, ninguém entregou o INSERT nem o UPDATE do
       // pagamento, e a comanda nunca saiu. O heartbeat já tinha sido migrado para o
       // caminho nativo pelo MESMO motivo; este ficou para trás.
-      const res = await httpJson<{ orders?: Order[] }>(`${apiUrl}/api/orders?storeId=${storeId}`, {
+      //
+      // Em regime normal pede SÓ o que mudou desde a última resposta (`updatedSince`); a
+      // lista inteira volta no arranque, a cada ORDERS_FULL_RESYNC_MS e quando o delta não
+      // for confiável. Servidor antigo ignora o parâmetro e devolve a lista inteira — que
+      // `applyOrdersPoll` trata como tal.
+      const now = Date.now();
+      if (ordersSyncRef.current.storeId !== storeId) {
+        activeOrdersRef.current = new Map();
+        ordersSyncRef.current = { storeId, cursor: null, lastFullAt: 0 };
+      }
+      const res = await httpJson<OrdersPollResponse>(`${apiUrl}/api/orders?storeId=${storeId}${ordersSyncQuery(ordersSyncRef.current, now)}`, {
         headers: await getAuthHeaders(),
       });
       // 401 = sessão expirada. Sem o relogin o polling ficaria mudo até alguém abrir o
@@ -1519,7 +1636,15 @@ function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = res.data;
       if (!data?.orders) return;
-      const all = data.orders as Order[];
+      // Resposta que chegou depois de a loja mudar (logout, troca de conta) não é desta.
+      if (ordersSyncRef.current.storeId !== storeId) return;
+      const applied = applyOrdersPoll(activeOrdersRef.current, ordersSyncRef.current, data, now);
+      activeOrdersRef.current = applied.active;
+      ordersSyncRef.current = applied.state;
+      // Mais recente primeiro, a mesma ordem da lista que a API devolvia inteira.
+      const all = [...applied.active.values()].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
       const queue = all.filter(o => o.status === 'ai_attention');
       const inProgress = all.filter(o => ['confirmed', 'preparing', 'delivering'].includes(o.status));
       const active = [...queue, ...inProgress];
@@ -1572,6 +1697,9 @@ function App() {
     receiptQueueRef.current = { storeId: store.id, since: resolveReceiptQueueSince(store.id) };
     printedViasRef.current = new Map();
     baselineDoneRef.current = false;
+    // A memória do polling é por loja: a primeira volta pede a lista inteira.
+    activeOrdersRef.current = new Map();
+    ordersSyncRef.current = { storeId: store.id, cursor: null, lastFullAt: 0 };
     syncFromServer(store.id);
     const interval = setInterval(() => syncFromServer(store.id), 10 * 1000);
     return () => clearInterval(interval);
@@ -2546,6 +2674,8 @@ function App() {
     printedOrderIdsRef.current = new Set();
     printedViasRef.current = new Map();
     baselineDoneRef.current = false;
+    activeOrdersRef.current = new Map();
+    ordersSyncRef.current = { storeId: '', cursor: null, lastFullAt: 0 };
     setNewOrders([]);
     setInProgressOrders([]);
     setSelectedOrder(null);
