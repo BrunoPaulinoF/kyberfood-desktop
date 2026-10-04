@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient, RealtimeChannel, processLock } from '@supabase/supabase-js';
 import { buildTestOrder, type TestOrderProduct } from './test-order';
+import { orderDisplayNumber } from './order-display';
+import { StatusPanel } from './components/StatusPanel';
+import { OrderCard } from './components/OrderCard';
+import { StatusBadge } from './components/StatusBadge';
 import { 
   Bell, 
   Printer, 
@@ -11,7 +15,6 @@ import {
   X, 
   Clock,
   MapPin,
-  Phone,
   User,
   ShoppingCart,
   RefreshCw,
@@ -221,6 +224,12 @@ interface PrintConfig {
   showPayment: boolean;
   showOrderNotes: boolean;
   footerText: string;
+  /**
+   * A impressão AUTOMÁTICA está ligada para esta loja? Desligada PELO PAINEL quando a comanda
+   * sai por outro sistema (PDV, Cardápio Web) — senão a cozinha recebe o pedido duas vezes.
+   * Só o `false` explícito desliga. ESPELHA `autoPrint` de src/lib/desktop-print-config.ts.
+   */
+  autoPrint: boolean;
 }
 
 const DEFAULT_PRINT_CONFIG: PrintConfig = {
@@ -237,6 +246,7 @@ const DEFAULT_PRINT_CONFIG: PrintConfig = {
   showPayment: true,
   showOrderNotes: true,
   footerText: 'OBRIGADO E BOM APETITE!',
+  autoPrint: true,
 };
 
 // Tamanho da fonte (em pt) enviado ao comando de impressão do Rust.
@@ -290,11 +300,42 @@ function normalizePrintConfig(value: any): PrintConfig {
     showPayment: bool(raw.showPayment, true),
     showOrderNotes: bool(raw.showOrderNotes, true),
     footerText: raw.footerText !== undefined ? String(raw.footerText) : DEFAULT_PRINT_CONFIG.footerText,
+    // `!== false`: um `null` no jsonb não pode parar a comanda de ninguém.
+    autoPrint: raw.autoPrint !== false,
   };
 }
 
+/**
+ * IMPRESSÃO DESLIGADA PELO PAINEL — e por que ela é guardada em DISCO.
+ *
+ * A chave vem no heartbeat, e o heartbeat leva até uma batida para responder. Sem guardar a
+ * última resposta, toda vez que o app abre ele imprimiria os pedidos pendentes ANTES de
+ * saber que a loja desligou a impressão — exatamente a comanda em dobro que a chave existe
+ * para evitar. Guardada, o app abre já sabendo.
+ *
+ * Por LOJA, como a fila da comanda. Disco ilegível ou chave nunca vista = LIGADA: o modo de
+ * falhar tem que ser "saiu papel a mais", nunca "a comanda parou de sair".
+ */
+const PANEL_AUTO_PRINT_STORAGE_KEY = 'kyberfood.desktop.panelAutoPrint';
+
+function loadPanelAutoPrint(storeId: string): boolean {
+  try {
+    return localStorage.getItem(`${PANEL_AUTO_PRINT_STORAGE_KEY}.${storeId}`) !== 'off';
+  } catch {
+    return true;
+  }
+}
+
+function savePanelAutoPrint(storeId: string, enabled: boolean) {
+  try {
+    localStorage.setItem(`${PANEL_AUTO_PRINT_STORAGE_KEY}.${storeId}`, enabled ? 'on' : 'off');
+  } catch {
+    /* sem disco vale a resposta do heartbeat, que chega a cada 30s */
+  }
+}
+
 // Types
-interface Order {
+export interface Order {
   id: string;
   order_number?: string | null;
   created_at: string;
@@ -497,7 +538,7 @@ function formatOrderDateTime(value: string, timezone?: string | null): string {
   }
 }
 
-interface OrderItem {
+export interface OrderItem {
   id: string;
   product_name: string;
   quantity: number;
@@ -512,7 +553,7 @@ interface OrderItem {
   is_gift?: boolean | null;
 }
 
-interface Store {
+export interface Store {
   id: string;
   name: string;
   address: string;
@@ -520,22 +561,13 @@ interface Store {
   timezone?: string | null;
 }
 
-interface Settings {
+export interface Settings {
   autoPrint: boolean;
   soundEnabled: boolean;
   selectedPrinter: string;
   volume: number;
 }
 
-// Número curto do pedido exibido na comanda/telas (4 últimos dígitos do telefone, com
-// sufixo -2, -3 em colisão no mesmo dia). Gravado pelo web app em orders.order_number;
-// pedidos antigos ficam sem e caem no fallback dos 8 primeiros caracteres do UUID.
-// Espelha formatOrderNumber() de src/lib/order-number.ts no web app.
-function orderDisplayNumber(order: { order_number?: string | null; id: string }): string {
-  const stored = order.order_number;
-  if (stored && String(stored).trim()) return String(stored).trim();
-  return String(order.id ?? '').slice(0, 8).toUpperCase();
-}
 
 /**
  * FILA DA COMANDA — o pedido que não imprimiu tem que sair quando o computador voltar.
@@ -615,6 +647,20 @@ function savePrintedOrders(storeId: string, printed: Map<string, number>) {
     // Sem disco a fila degrada para o que era antes (memória): a impressão continua
     // funcionando, só não sobrevive ao desligamento.
   }
+}
+
+/**
+ * Dá a comanda como RESOLVIDA neste computador sem imprimir nada — o caminho da impressão
+ * desligada PELO PAINEL. Grava na mesma lista de impressos (memória + disco) para que
+ * religar a chave não despeje na impressora os pedidos que o outro sistema já imprimiu.
+ * O servidor NÃO é carimbado: o carimbo afirma que a comanda saiu DAQUI.
+ */
+function resolveReceiptWithoutPrinting(storeId: string | null, orderId: string, printedIds: Set<string>) {
+  printedIds.add(orderId);
+  if (!storeId) return;
+  const printed = loadPrintedOrders(storeId);
+  printed.set(orderId, Date.now());
+  savePrintedOrders(storeId, printed);
 }
 
 /**
@@ -812,6 +858,58 @@ function notifyPrintFailure(order: Order, reason: string) {
     /* o aviso é secundário: nunca pode derrubar o caminho da impressão */
   }
 }
+
+/**
+ * A MESMA loja, com os mesmos dados — compara campo a campo, nunca a referência.
+ *
+ * A sessão é renovada sozinha (TOKEN_REFRESHED, ~1x por hora e a cada volta da internet), e
+ * cada renovação relia a loja e chamava `setStore` com um objeto NOVO de conteúdo igual. Os
+ * efeitos que dependem de `[store]` rodavam de novo a cada vez: o polling reiniciava, o
+ * realtime e a fila de impressão eram refeitos e — o que custava papel — o contador de vias
+ * (`printedViasRef`) era zerado, de modo que uma 2ª via que tinha falhado voltava a sair a
+ * comanda inteira. Mesma loja com os mesmos dados mantém o objeto ANTIGO, e nada reinicia.
+ */
+function sameStore(a: Store | null, b: Store | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.address === b.address &&
+    a.phone === b.phone &&
+    (a.timezone ?? null) === (b.timezone ?? null)
+  );
+}
+
+/**
+ * Mesmo conteúdo, para listas e configurações que chegam do servidor sempre como objeto NOVO.
+ *
+ * O polling (10s) e o heartbeat (30s) gravavam no estado um array/objeto novo mesmo quando
+ * nada tinha mudado, e o React redesenhava a tela inteira a cada volta — inclusive com a
+ * janela escondida na bandeja o dia todo, num PC fraco de balcão. Conteúdo igual mantém a
+ * referência antiga e o React não redesenha nada. Na dúvida (valor que não vira JSON),
+ * responde "diferente": redesenhar à toa é o erro barato; deixar de mostrar um pedido não é.
+ */
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pedidos que JÁ abriram a janela de impressão do navegador (o plano B quando a impressora
+ * não responde).
+ *
+ * O plano B rodava a CADA tentativa: com a impressora desligada, o polling retenta a cada
+ * 10s e cada volta abria uma janela nova — dezenas de MB cada, acumulando a tarde inteira
+ * num PC de 4 GB, e todas invisíveis com o app escondido na bandeja. Agora a janela abre no
+ * máximo UMA vez por pedido, e só com o app à vista (ver `printOrder`). A retentativa pela
+ * impressora continua igual: é ela que imprime de verdade.
+ */
+const browserFallbackOrderIds = new Set<string>();
 
 const DEFAULT_SETTINGS: Settings = {
   autoPrint: true,
@@ -1080,6 +1178,18 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
 // Audio context for notifications
 let audioContext: AudioContext | null = null;
 
+/**
+ * Quanto tempo depois do último alarme o som é DESLIGADO (suspenso).
+ *
+ * Um AudioContext criado fica RODANDO para sempre: a thread de áudio acorda a cada poucos
+ * milissegundos o dia inteiro, mesmo em silêncio — custo de processador à toa num PC fraco.
+ * Suspender depois do alarme para isso; o próximo alarme o liga de novo pelo MESMO caminho
+ * (`resume()`) que já existia para o contexto que nasce suspenso. A folga é larga (o alarme
+ * dura ~1,8s) para uma rajada de pedidos não ficar ligando e desligando o som.
+ */
+const ALARM_IDLE_SUSPEND_MS = 15_000;
+let audioSuspendTimer: ReturnType<typeof setTimeout> | null = null;
+
 // Alarme de novo pedido: precisa ser CHAMATIVO e ALTO para a equipe ouvir na hora,
 // mas curto (no máx. ~2s). Tocamos uma tríade ascendente repetida 3 vezes (~1,8s),
 // com volume elevado, agendada com precisão pelo relógio do AudioContext.
@@ -1088,10 +1198,18 @@ function playNotificationSound() {
     audioContext = new AudioContext();
   }
   const ctx = audioContext;
-  // O contexto pode estar "suspended" (política de autoplay): tenta retomar.
+  // O contexto pode estar "suspended" (política de autoplay, ou desligado pelo
+  // `ALARM_IDLE_SUSPEND_MS` depois do alarme anterior): tenta retomar.
   if (ctx.state === 'suspended') {
     ctx.resume().catch(() => {});
   }
+  // Alarme novo cancela o desligamento agendado pelo anterior e agenda outro, contado a
+  // partir de AGORA: senão o desligamento do alarme antigo cortaria este no meio.
+  if (audioSuspendTimer) clearTimeout(audioSuspendTimer);
+  audioSuspendTimer = setTimeout(() => {
+    audioSuspendTimer = null;
+    if (ctx.state === 'running') ctx.suspend().catch(() => {});
+  }, ALARM_IDLE_SUSPEND_MS);
 
   const tone = (
     freq: number,
@@ -1178,6 +1296,12 @@ function App() {
   const printConfigRef = useRef(printConfig);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { printConfigRef.current = printConfig; }, [printConfig]);
+  // Impressão automática desligada PELO PAINEL (ver loadPanelAutoPrint). O ref é o que
+  // `processIncomingOrder` (memoizado) lê; o estado é o aviso na tela. Os dois são escritos
+  // JUNTOS, nunca por efeito: o efeito roda depois do render, e nessa janela o polling já
+  // teria impresso com o valor antigo.
+  const panelAutoPrintRef = useRef(true);
+  const [panelAutoPrint, setPanelAutoPrint] = useState(true);
   // Refs das listas para os handlers de realtime/reconciliação lerem o estado
   // atual sem recriar o canal a cada mudança.
   const newOrdersRef = useRef(newOrders);
@@ -1207,6 +1331,8 @@ function App() {
    * pedido fica com menos vias do que o lojista configurou.
    */
   const printedViasRef = useRef<Map<string, number>>(new Map());
+  // De qual loja é o contador acima: ele só é zerado quando a loja MUDA (ver o efeito do polling).
+  const printedViasStoreIdRef = useRef<string>('');
   // Linha de base: na 1ª sincronização após o login NÃO alertamos os pedidos que
   // já existiam. Ela vale só para o SOM/notificação — a impressão é decidida pela fila
   // gravada em disco, senão a comanda pendente de uma queda de energia nasceria "já
@@ -1457,7 +1583,13 @@ function App() {
 
         const data = res.data;
         if (cancelled) return;
-        if (data?.print_config) setPrintConfig(normalizePrintConfig(data.print_config));
+        if (data?.print_config) {
+          const config = normalizePrintConfig(data.print_config);
+          setPrintConfig(prev => (sameJson(prev, config) ? prev : config));
+          panelAutoPrintRef.current = config.autoPrint;
+          setPanelAutoPrint(config.autoPrint);
+          savePanelAutoPrint(store.id, config.autoPrint);
+        }
         setAiServing(data?.ai_gate?.ai_serving !== false);
         setAiGateMode(typeof data?.ai_gate?.mode === 'string' ? data.ai_gate.mode : null);
         setHeartbeatFailing(false);
@@ -1559,9 +1691,21 @@ function App() {
       queueSince: receiptQueueRef.current.since,
       now: Date.now(),
     });
-    if (verdict === 'too_old') notifyStaleReceipt(order);
+
+    // IMPRESSÃO DESLIGADA PELO PAINEL: a comanda desta loja sai por OUTRO sistema (PDV,
+    // Cardápio Web), e imprimir aqui também mandaria o mesmo pedido duas vezes à cozinha.
+    // O pedido é dado como RESOLVIDO neste computador (só no disco daqui — o servidor não é
+    // carimbado, porque esta máquina não imprimiu nada): sem isso, religar a chave cuspiria
+    // de uma vez as comandas de horas de pedidos que o outro sistema já imprimiu, e o aviso de
+    // "comanda antiga não impressa" dispararia para cada um deles.
+    const panelPrintingOff = !panelAutoPrintRef.current;
+    if (panelPrintingOff && verdict === 'print') {
+      resolveReceiptWithoutPrinting(receiptQueueRef.current.storeId, order.id, printedOrderIdsRef.current);
+    }
+    if (!panelPrintingOff && verdict === 'too_old') notifyStaleReceipt(order);
 
     const canPrint = verdict === 'print'
+      && !panelPrintingOff
       && settingsRef.current.autoPrint
       && !printingOrderIdsRef.current.has(order.id);
 
@@ -1673,8 +1817,10 @@ function App() {
         .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
         .forEach(o => processIncomingOrder(o));
 
-      setNewOrders(queue);
-      setInProgressOrders(inProgress);
+      // Conteúdo igual mantém a lista antiga: sem isto a tela inteira era redesenhada a cada
+      // 10s, o dia todo, mesmo escondida na bandeja (ver `sameJson`).
+      setNewOrders(prev => (sameJson(prev, queue) ? prev : queue));
+      setInProgressOrders(prev => (sameJson(prev, inProgress) ? prev : inProgress));
     } catch (err) {
       console.error('Erro ao sincronizar pedidos:', err);
     }
@@ -1695,7 +1841,18 @@ function App() {
     // saíram, para não repetir.
     printedOrderIdsRef.current = new Set(loadPrintedOrders(store.id).keys());
     receiptQueueRef.current = { storeId: store.id, since: resolveReceiptQueueSince(store.id) };
-    printedViasRef.current = new Map();
+    // ANTES da primeira busca de pedidos: é o que impede o app de imprimir os pendentes ao
+    // abrir, numa loja que desligou a impressão pelo painel (o heartbeat ainda não respondeu).
+    const panelAutoPrintSaved = loadPanelAutoPrint(store.id);
+    panelAutoPrintRef.current = panelAutoPrintSaved;
+    setPanelAutoPrint(panelAutoPrintSaved);
+    // O contador de vias só recomeça quando a LOJA muda. Rodar este efeito de novo para a
+    // mesma loja (sessão renovada, relogin) não pode esquecer que a 1ª via já saiu: a
+    // retentativa da 2ª mandaria a comanda inteira de novo para a cozinha.
+    if (printedViasStoreIdRef.current !== store.id) {
+      printedViasRef.current = new Map();
+      printedViasStoreIdRef.current = store.id;
+    }
     baselineDoneRef.current = false;
     // A memória do polling é por loja: a primeira volta pede a lista inteira.
     activeOrdersRef.current = new Map();
@@ -2118,7 +2275,17 @@ function App() {
       // FORA DO TESTE: no teste quem clicou está OLHANDO a tela e recebe a falha escrita ali.
       // Uma janela de impressão do navegador surgindo por cima do modal responderia outra
       // pergunta (a do navegador), e ainda faria o lojista achar que o teste funcionou.
-      const receiptHtml = silencioso ? null : generateReceiptHtml(order, store!);
+      //
+      // NO MÁXIMO UMA VEZ POR PEDIDO E SÓ COM O APP À VISTA (ver `browserFallbackOrderIds`):
+      // escondido na bandeja ninguém vê a janela, e a retentativa de 10s abria uma nova a cada
+      // volta. A reimpressão pedida por um clique (`copies`) sempre pode abrir: quem clicou
+      // está olhando a tela.
+      const appVisivel = typeof document === 'undefined' || document.visibilityState === 'visible';
+      const podeAbrirJanela = !silencioso
+        && appVisivel
+        && (reimpressao || !browserFallbackOrderIds.has(order.id));
+      if (podeAbrirJanela && !reimpressao) browserFallbackOrderIds.add(order.id);
+      const receiptHtml = podeAbrirJanela ? generateReceiptHtml(order, store!) : null;
       const printWindow = receiptHtml ? window.open('', '_blank', 'width=400,height=600') : null;
       if (printWindow && receiptHtml) {
         printWindow.document.write(receiptHtml);
@@ -2558,7 +2725,8 @@ function App() {
         const storeData = await loadStoreForUser(userId);
         if (!active) return;
         if (storeData) {
-          setStore(storeData);
+          // Renovação da sessão com a MESMA loja não troca o objeto (ver `sameStore`).
+          setStore(prev => (sameStore(prev, storeData) ? prev : storeData));
           setIsAuthenticated(true);
         }
       } catch (err) {
@@ -2630,7 +2798,7 @@ function App() {
         reloginStreakRef.current = 0;
         lastReloginAtRef.current = 0;
         setReloginWaiting(false);
-        setStore(storeData);
+        setStore(prev => (sameStore(prev, storeData) ? prev : storeData));
         setIsAuthenticated(true);
         setReconnecting(false);
         setError(null);
@@ -2673,6 +2841,7 @@ function App() {
     seenOrderIdsRef.current = new Set();
     printedOrderIdsRef.current = new Set();
     printedViasRef.current = new Map();
+    printedViasStoreIdRef.current = '';
     baselineDoneRef.current = false;
     activeOrdersRef.current = new Map();
     ordersSyncRef.current = { storeId: '', cursor: null, lastFullAt: 0 };
@@ -2928,6 +3097,7 @@ function App() {
         <StatusPanel
           store={store!}
           settings={settings}
+          printingOffByPanel={!panelAutoPrint}
           lastOrderInfo={lastOrderInfo}
           onOpenSettings={() => setShowSettings(true)}
           onLogout={() => setConfirmLogout(true)}
@@ -3071,92 +3241,6 @@ function App() {
 
 // Painel de status (modo atual do app: só recebe pedidos, imprime e toca o som).
 // Sem gerência/visualização de pedidos — isso é feito no site do KyberFood.
-function StatusPanel({
-  store,
-  settings,
-  lastOrderInfo,
-  onOpenSettings,
-  onLogout,
-}: {
-  store: Store;
-  settings: Settings;
-  lastOrderInfo: { number: string; at: number; printed: boolean } | null;
-  onOpenSettings: () => void;
-  onLogout: () => void;
-}) {
-  const hasPrinter = !!settings.selectedPrinter;
-  return (
-    <main className="flex flex-col items-center justify-center min-h-[calc(100vh-73px)] p-6">
-      <div className="w-full max-w-md bg-gray-800 rounded-2xl border border-gray-700 p-8 text-center">
-        <div className="mx-auto w-16 h-16 rounded-full bg-green-600/20 flex items-center justify-center mb-4">
-          <CheckCircle2 className="w-9 h-9 text-green-400" />
-        </div>
-        <h2 className="text-xl font-bold mb-1">Recebendo pedidos</h2>
-        <p className="text-gray-400 text-sm mb-1">{store.name}</p>
-        <p className="text-gray-500 text-xs mb-6">
-          Novos pedidos são impressos automaticamente e tocam o som de notificação.
-          Pode minimizar: o app continua ativo na bandeja. A gestão dos pedidos é feita no site.
-        </p>
-
-        {/* Impressora selecionada (ou aviso para configurar) */}
-        <div
-          className={`rounded-lg px-4 py-3 mb-3 flex items-center justify-between text-sm ${
-            hasPrinter ? 'bg-gray-700/60' : 'bg-red-900/40 border border-red-500/50'
-          }`}
-        >
-          <span className="flex items-center gap-2">
-            <Printer className="w-4 h-4" />
-            {hasPrinter ? 'Impressora' : 'Selecione uma impressora'}
-          </span>
-          <span className={hasPrinter ? 'text-gray-200 font-medium truncate max-w-[180px]' : 'text-red-300'}>
-            {hasPrinter ? settings.selectedPrinter : '—'}
-          </span>
-        </div>
-
-        {/* Resumo: som + auto-impressão */}
-        <div className="grid grid-cols-2 gap-3 mb-4 text-sm">
-          <div className="rounded-lg bg-gray-700/60 px-3 py-2 flex items-center justify-center gap-2">
-            {settings.soundEnabled ? (
-              <Volume2 className="w-4 h-4 text-green-400" />
-            ) : (
-              <VolumeX className="w-4 h-4 text-gray-500" />
-            )}
-            Som {settings.soundEnabled ? 'ligado' : 'desligado'}
-          </div>
-          <div className="rounded-lg bg-gray-700/60 px-3 py-2 flex items-center justify-center gap-2">
-            <Printer className={`w-4 h-4 ${settings.autoPrint ? 'text-green-400' : 'text-gray-500'}`} />
-            Auto {settings.autoPrint ? 'ligado' : 'desligado'}
-          </div>
-        </div>
-
-        {/* Última atividade (confirma que o app está recebendo/imprimindo) */}
-        {lastOrderInfo && (
-          <p className="text-xs text-gray-500 mb-6">
-            Último pedido: <span className="text-gray-300 font-medium">#{lastOrderInfo.number}</span> às{' '}
-            {new Date(lastOrderInfo.at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}{' '}
-            {lastOrderInfo.printed ? '(impresso)' : '(auto-impressão desligada)'}
-          </p>
-        )}
-
-        <button
-          onClick={onOpenSettings}
-          className="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold py-2.5 rounded-lg mb-3 flex items-center justify-center gap-2"
-        >
-          <Settings className="w-4 h-4" />
-          Impressão e Som
-        </button>
-        <button
-          onClick={onLogout}
-          className="w-full bg-gray-700 hover:bg-gray-600 text-gray-200 py-2 rounded-lg flex items-center justify-center gap-2 text-sm"
-        >
-          <LogOut className="w-4 h-4" />
-          Sair da conta
-        </button>
-      </div>
-    </main>
-  );
-}
-
 /**
  * Confirmação de saída da conta.
  *
@@ -3316,85 +3400,6 @@ function LoginScreen({ onLogin, error }: { onLogin: (email: string, password: st
 }
 
 // Order Card Component
-function OrderCard({ 
-  order, 
-  isNew,
-  onSelect, 
-  onPrint, 
-  onAccept, 
-  onReject 
-}: { 
-  order: Order; 
-  isNew: boolean;
-  onSelect: () => void;
-  onPrint: () => void;
-  onAccept: () => void;
-  onReject: () => void;
-}) {
-  return (
-    <div 
-      className={`bg-gray-700 rounded-lg p-4 cursor-pointer hover:bg-gray-600 transition-colors ${
-        isNew ? 'ring-2 ring-red-500' : ''
-      }`}
-      onClick={onSelect}
-    >
-      <div className="flex justify-between items-start mb-2">
-        <div>
-          <p className="font-bold text-lg">#{orderDisplayNumber(order)}</p>
-          <p className="text-gray-300">{order.customer_name}</p>
-        </div>
-        <span className="text-gray-400 text-sm">
-          {new Date(order.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
-        </span>
-      </div>
-      
-      <div className="flex items-center gap-2 text-sm text-gray-400 mb-3">
-        <Phone className="w-3 h-3" />
-        <span>{order.customer_phone}</span>
-      </div>
-      
-      <div className="flex items-start gap-2 text-sm text-gray-400 mb-3">
-        <MapPin className="w-3 h-3 mt-1" />
-        <span>{order.delivery_address}</span>
-      </div>
-      
-      <div className="border-t border-gray-600 pt-3 mt-3">
-        <div className="flex justify-between text-sm mb-1">
-          <span className="text-gray-400">Itens:</span>
-          <span>{order.items?.length || 0}</span>
-        </div>
-        <div className="flex justify-between font-bold">
-          <span>Total:</span>
-          <span className="text-green-400">R$ {order.total.toFixed(2)}</span>
-        </div>
-      </div>
-      
-      <div className="flex gap-2 mt-4">
-        <button
-          onClick={(e) => { e.stopPropagation(); onPrint(); }}
-          className="flex-1 bg-gray-600 hover:bg-gray-500 py-2 rounded-lg flex items-center justify-center gap-1"
-        >
-          <Printer className="w-4 h-4" />
-          Imprimir
-        </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onAccept(); }}
-          className="flex-1 bg-green-600 hover:bg-green-700 py-2 rounded-lg flex items-center justify-center gap-1"
-        >
-          <Check className="w-4 h-4" />
-          Aceitar
-        </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onReject(); }}
-          className="bg-red-600 hover:bg-red-700 py-2 px-3 rounded-lg"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // Order Details Component
 function OrderDetails({ 
   order, 
@@ -3601,26 +3606,6 @@ function OrderDetails({
         )}
       </div>
     </div>
-  );
-}
-
-// Status Badge Component
-function StatusBadge({ status, large }: { status: string; large?: boolean }) {
-  const statusConfig: Record<string, { label: string; color: string }> = {
-    ai_attention: { label: 'Novo', color: 'bg-red-600' },
-    confirmed: { label: 'Confirmado', color: 'bg-blue-600' },
-    preparing: { label: 'Preparando', color: 'bg-yellow-600' },
-    delivering: { label: 'Entregando', color: 'bg-purple-600' },
-    completed: { label: 'Entregue', color: 'bg-green-600' },
-    cancelled: { label: 'Cancelado', color: 'bg-gray-600' },
-  };
-
-  const config = statusConfig[status] || { label: status, color: 'bg-gray-600' };
-
-  return (
-    <span className={`${config.color} px-2 py-1 rounded text-sm ${large ? 'text-base px-3 py-1' : ''}`}>
-      {config.label}
-    </span>
   );
 }
 

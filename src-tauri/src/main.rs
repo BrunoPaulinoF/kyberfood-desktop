@@ -27,7 +27,10 @@ pub struct PrintOptions {
 ///
 /// Vem de `EnumPrintersW` (a API do próprio Windows), não mais de uma consulta WMI rodada
 /// por um PowerShell oculto — ver o cabeçalho de `win_print.rs` para o porquê.
-#[tauri::command]
+///
+/// `async`: com impressora de REDE desligada, o `EnumPrintersW` pode demorar a responder, e
+/// um comando síncrono roda na thread PRINCIPAL — a janela inteira congelaria junto.
+#[tauri::command(async)]
 fn get_printers() -> Vec<PrinterInfo> {
     #[cfg(target_os = "windows")]
     {
@@ -239,8 +242,44 @@ fn render_receipt_pdf(content: &str, width: i32, font_pt: f64) -> Result<std::pa
 /// Estratégia (Windows): impressão RAW/ESC-POS direto no spooler primeiro — é o
 /// caminho confiável, rápido e sem dependências (não precisa de leitor de PDF).
 /// Só se ele falhar caímos para o PDF + PrintTo. No macOS/Linux (dev) usamos lp.
-#[tauri::command]
+///
+/// `async` + `PRINT_LOCK`: ver o comentário de `PRINT_LOCK`.
+#[tauri::command(async)]
 fn print_receipt(
+    printer_name: Option<String>,
+    content: String,
+    width: Option<i32>,
+    font_size: Option<f64>,
+) -> Result<(), String> {
+    let _guard = lock_printing();
+    print_receipt_impl(printer_name, content, width, font_size)
+}
+
+/// UMA impressão por vez, e FORA da thread principal.
+///
+/// Os dois comandos de impressão eram SÍNCRONOS, e comando síncrono do Tauri roda na thread
+/// PRINCIPAL: enquanto o spooler respondia (ou, no plano B, enquanto o leitor de PDF não
+/// fechava — até 2 minutos, `PDF_WAIT_TIMEOUT_MS`), a janela congelava inteira, o
+/// `renderer_alive` parava de responder e o vigia (`RENDERER_SILENCE_RELOAD_SECS`) RECARREGAVA
+/// a página no meio da impressão — e a comanda podia sair de novo depois do recarregamento.
+///
+/// Com `async` os comandos rodam fora da thread principal, e aí duas impressões podem correr
+/// AO MESMO TEMPO. O plano B grava o PDF num caminho FIXO (`kyberfood_receipt.pdf`): em
+/// paralelo, uma comanda sobrescreveria a outra antes de o leitor abri-la. Este cadeado
+/// mantém a ordem de antes — uma de cada vez —, sem prender a janela.
+///
+/// Só os COMANDOS tomam o cadeado; as funções `_impl` não. `print_receipt_graphic` cai no
+/// texto chamando `print_receipt_impl` direto: tomar o cadeado ali de novo travaria a si
+/// mesmo (o `Mutex` da std não é reentrante).
+static PRINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_printing() -> std::sync::MutexGuard<'static, ()> {
+    // Cadeado "envenenado" (uma impressão anterior entrou em pânico) não pode parar todas as
+    // comandas seguintes: o `()` protegido não tem estado a corromper.
+    PRINT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn print_receipt_impl(
     printer_name: Option<String>,
     content: String,
     width: Option<i32>,
@@ -303,8 +342,19 @@ fn print_receipt(
 /// `fallback_content` é a MESMA comanda em texto (o formato do modo de sempre): se o
 /// spooler recusar o RAW gráfico, a comanda sai pelo caminho de texto — perder a fonte
 /// bonita é degradação; perder a comanda é a cozinha sem o pedido.
-#[tauri::command]
+#[tauri::command(async)]
 fn print_receipt_graphic(
+    printer_name: Option<String>,
+    layout: String,
+    fallback_content: String,
+    width: Option<i32>,
+    font_size: Option<f64>,
+) -> Result<(), String> {
+    let _guard = lock_printing();
+    print_receipt_graphic_impl(printer_name, layout, fallback_content, width, font_size)
+}
+
+fn print_receipt_graphic_impl(
     printer_name: Option<String>,
     layout: String,
     fallback_content: String,
@@ -328,7 +378,7 @@ fn print_receipt_graphic(
             Err(e) => e,
         };
         // Degrada para o modo texto (RAW de texto e, falhando também, PDF).
-        return print_receipt(Some(printer), fallback_content, Some(receipt_width_chars), Some(font_pt))
+        return print_receipt_impl(Some(printer), fallback_content, Some(receipt_width_chars), Some(font_pt))
             .map_err(|text_err| format!("Grafico: {} | {}", graphic_err, text_err));
     }
 
@@ -337,7 +387,7 @@ fn print_receipt_graphic(
         // No desenvolvimento (macOS/Linux) não há spooler RAW: valida o layout e cai no PDF
         // de texto, como o modo de sempre.
         receipt_raster::build_escpos_graphic(&layout, receipt_width_chars, font_pt)?;
-        print_receipt(Some(printer), fallback_content, Some(receipt_width_chars), Some(font_pt))
+        print_receipt_impl(Some(printer), fallback_content, Some(receipt_width_chars), Some(font_pt))
     }
 }
 
