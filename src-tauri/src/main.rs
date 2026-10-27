@@ -105,11 +105,21 @@ fn to_ascii_bytes(text: &str) -> Vec<u8> {
 /// ESPELHA RECEIPT_EMPHASIS_PREFIX de src/lib/desktop-print-config.ts no app web.
 const EMPHASIS_PREFIX: char = '\u{0002}';
 
-/// Separa a marca de destaque do texto da linha.
-fn split_emphasis(line: &str) -> (&str, bool) {
+/// Prefixo (ETX) de linha ENORME: negrito + LARGURA e altura dupla. Só a HORA MARCADA usa
+/// (pedido do lojista, 08/10/2026: na letra "grande" o destaque comum tem a mesma altura do
+/// corpo e a equipe não lia o agendamento). O front já monta essa linha com METADE das
+/// colunas, por isso a largura dupla não estoura o papel.
+/// ESPELHA RECEIPT_HUGE_PREFIX de src/lib/desktop-print-config.ts no app web.
+const HUGE_PREFIX: char = '\u{0003}';
+
+/// Separa a marca de destaque do texto da linha: (texto, destaque, enorme).
+fn split_emphasis(line: &str) -> (&str, bool, bool) {
+    if let Some(rest) = line.strip_prefix(HUGE_PREFIX) {
+        return (rest, true, true);
+    }
     match line.strip_prefix(EMPHASIS_PREFIX) {
-        Some(rest) => (rest, true),
-        None => (line, false),
+        Some(rest) => (rest, true, false),
+        None => (line, false, false),
     }
 }
 
@@ -156,11 +166,15 @@ fn build_escpos(content: &str, font_pt: f64) -> Vec<u8> {
     // pedido (entrega/retirada) e as observações, que a cozinha precisa enxergar de longe.
     // Só a ALTURA dobra — largura dupla mudaria a contagem de colunas e quebraria todo o
     // alinhamento montado pelo front.
+    // Linha ENORME: largura dupla (nibble alto 0x10) + a altura do destaque.
+    let huge_size: u8 = 0x10 | emphasis_size;
+
     for line in content.lines() {
-        let (text, strong) = split_emphasis(line);
+        let (text, strong, huge) = split_emphasis(line);
         if strong {
             bytes.extend_from_slice(&[0x1B, 0x45, 0x01]); // ESC E 1 -> negrito
-            bytes.extend_from_slice(&[0x1D, 0x21, emphasis_size]); // GS ! -> altura do destaque
+            let size = if huge { huge_size } else { emphasis_size };
+            bytes.extend_from_slice(&[0x1D, 0x21, size]); // GS ! -> tamanho do destaque
         }
         bytes.extend_from_slice(&to_ascii_bytes(text));
         // O LF vai AINDA em altura dupla de propósito: é ele que reserva o espaço vertical
@@ -199,11 +213,22 @@ fn render_receipt_pdf(content: &str, width: i32, font_pt: f64) -> Result<std::pa
     // Linha em destaque também sai maior e em negrito no PDF: este caminho é o fallback
     // das impressoras que não falam ESC/POS, e nelas a comanda tem que ficar igual.
     const EMPHASIS_SCALE: f64 = 1.4;
+    // Linha ENORME (hora marcada): ela já vem com metade das colunas, então cabe no dobro.
+    const HUGE_SCALE: f64 = 2.0;
+    let scale_of = |strong: bool, huge: bool| -> f64 {
+        if huge {
+            HUGE_SCALE
+        } else if strong {
+            EMPHASIS_SCALE
+        } else {
+            1.0
+        }
+    };
 
-    let lines: Vec<(&str, bool)> = content.lines().map(split_emphasis).collect();
+    let lines: Vec<(&str, bool, bool)> = content.lines().map(split_emphasis).collect();
     let content_height_mm: f64 = lines
         .iter()
-        .map(|(_, strong)| if *strong { line_height * EMPHASIS_SCALE } else { line_height })
+        .map(|(_, strong, huge)| line_height * scale_of(*strong, *huge))
         .sum();
     let page_height_mm: f64 = content_height_mm + 20.0;
 
@@ -218,11 +243,11 @@ fn render_receipt_pdf(content: &str, width: i32, font_pt: f64) -> Result<std::pa
         .map_err(|e| e.to_string())?;
 
     let mut y_pos: f64 = page_height_mm - 8.0;
-    for (text, strong) in lines {
-        let size = if strong { font_pt * EMPHASIS_SCALE } else { font_pt };
+    for (text, strong, huge) in lines {
+        let scale = scale_of(strong, huge);
         let face = if strong { &font_bold } else { &font };
-        current_layer.use_text(text, size, Mm(2.0), Mm(y_pos), face);
-        y_pos -= if strong { line_height * EMPHASIS_SCALE } else { line_height };
+        current_layer.use_text(text, font_pt * scale, Mm(2.0), Mm(y_pos), face);
+        y_pos -= line_height * scale;
         if y_pos < 3.0 {
             break;
         }

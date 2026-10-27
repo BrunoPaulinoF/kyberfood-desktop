@@ -1,6 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient, RealtimeChannel, processLock } from '@supabase/supabase-js';
 import { buildTestOrder, type TestOrderProduct } from './test-order';
+import {
+  CLOCK_CHECK_INTERVAL_MS,
+  describeClockSkew,
+  measureClockSkew,
+  type ClockSkewNotice,
+} from './clock-skew';
 import { orderDisplayNumber } from './order-display';
 import { StatusPanel } from './components/StatusPanel';
 import { OrderCard } from './components/OrderCard';
@@ -374,6 +380,10 @@ export interface Order {
     } | null;
     /** 'pickup' | 'delivery' — tipo do pedido gravado na criação pelo app web. */
     order_type?: string | null;
+    /** Mesa do pedido feito no salão (QR Code ou garçom). */
+    table?: { id?: unknown; label?: unknown } | null;
+    /** `false` = pedido do salão que vai SÓ para a tela da cozinha (sem comanda automática). */
+    auto_print?: boolean | null;
   } | null;
 }
 
@@ -692,7 +702,16 @@ function receiptReferenceTime(order: Order): number | null {
   return Number.isFinite(stamp) ? stamp : null;
 }
 
-type ReceiptQueueVerdict = 'print' | 'already_printed' | 'not_printable' | 'before_queue' | 'too_old';
+type ReceiptQueueVerdict = 'print' | 'already_printed' | 'not_printable' | 'before_queue' | 'too_old' | 'screen_only';
+
+/**
+ * Pedido do salão que a loja mandou SÓ para a tela da cozinha (`metadata.auto_print === false`,
+ * gravado pelo servidor). Só o `false` explícito vale. ESPELHA orderAutoPrintOff de
+ * src/lib/order-receipt-queue.ts.
+ */
+function orderAutoPrintOff(order: Pick<Order, 'metadata'>): boolean {
+  return order.metadata?.auto_print === false;
+}
 
 function classifyReceiptPrint(
   order: Order,
@@ -700,6 +719,7 @@ function classifyReceiptPrint(
 ): ReceiptQueueVerdict {
   if (!['confirmed', 'preparing', 'delivering'].includes(order.status)) return 'not_printable';
   if (opts.printedLocally) return 'already_printed';
+  if (orderAutoPrintOff(order)) return 'screen_only';
 
   const reference = receiptReferenceTime(order);
   // Sem data legível não dá para saber se é o pedido de agora ou o da semana passada;
@@ -1368,6 +1388,35 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   // Erro de impressão visível na tela (o app vive na bandeja: console não basta).
   const [printError, setPrintError] = useState<string | null>(null);
+  // RELÓGIO DO COMPUTADOR ERRADO (incidente Q Sabor, 11/10/2026): o login confere o
+  // vencimento do token com o relógio LOCAL, então com a data/hora errada o app desloga e
+  // fica reconectando sem dizer por quê. Este aviso diz a causa e como corrigir.
+  const [clockNotice, setClockNotice] = useState<ClockSkewNotice | null>(null);
+  const checkClock = useCallback(async () => {
+    try {
+      const sentAtMs = Date.now();
+      const res = await httpJson<{ now?: unknown }>(`${apiUrl}/api/time`, { timeoutSeconds: 10 });
+      const receivedAtMs = Date.now();
+      if (!res.ok) return;
+      const skew = measureClockSkew({ sentAtMs, receivedAtMs, serverNowMs: res.data?.now });
+      // Medida não confiável (rede lenta, resposta estranha) não muda nada: sem certeza,
+      // nada é afirmado — nem o aviso aparece, nem um aviso verdadeiro some.
+      if (skew === null) return;
+      setClockNotice(describeClockSkew(skew, Date.now(), 'app'));
+    } catch {
+      // Sem internet não há como conferir; o aviso de conexão já cobre esse caso.
+    }
+  }, []);
+  useEffect(() => {
+    void checkClock();
+    const interval = window.setInterval(() => void checkClock(), CLOCK_CHECK_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, [checkClock]);
+  // Quando a conta cai ou o login falha, confere de novo na hora: é exatamente o sintoma
+  // que o relógio errado produz, e quem acabou de acertar o relógio vê o aviso sumir.
+  useEffect(() => {
+    if (reconnecting || error) void checkClock();
+  }, [reconnecting, error, checkClock]);
   // Aviso ao mudar status (falha de rede, conflito de concorrência, Saipos) —
   // sem isto o botão "parecia" não funcionar quando a chamada falhava.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1700,6 +1749,12 @@ function App() {
     // "comanda antiga não impressa" dispararia para cada um deles.
     const panelPrintingOff = !panelAutoPrintRef.current;
     if (panelPrintingOff && verdict === 'print') {
+      resolveReceiptWithoutPrinting(receiptQueueRef.current.storeId, order.id, printedOrderIdsRef.current);
+    }
+    // PEDIDO DO SALÃO "SÓ NA TELA DA COZINHA": a loja escolheu não imprimir o pedido da mesa
+    // (ele aparece na tela da cozinha). Resolvido aqui sem papel e sem carimbar o servidor; a
+    // reimpressão pedida pelo painel continua saindo (ela não passa por este veredito).
+    if (verdict === 'screen_only') {
       resolveReceiptWithoutPrinting(receiptQueueRef.current.storeId, order.id, printedOrderIdsRef.current);
     }
     if (!panelPrintingOff && verdict === 'too_old') notifyStaleReceipt(order);
@@ -2884,6 +2939,7 @@ function App() {
         <div className="flex flex-col items-center gap-4 text-gray-400">
           <RefreshCw className="w-8 h-8 text-orange-500 animate-spin" />
           <span className="text-sm">Conectando…</span>
+          {clockNotice && <ClockSkewWarning notice={clockNotice} />}
         </div>
       </div>
     );
@@ -2909,6 +2965,7 @@ function App() {
               tentando sozinho — pode deixar aberto.
             </span>
           )}
+          {clockNotice && <ClockSkewWarning notice={clockNotice} />}
         </div>
       </div>
     );
@@ -2919,7 +2976,7 @@ function App() {
     return (
       <>
         {alreadyOpenNotice && <AlreadyOpenNotice onClose={() => setAlreadyOpenNotice(false)} />}
-        <LoginScreen onLogin={handleLogin} error={error} />
+        <LoginScreen onLogin={handleLogin} error={error} clockNotice={clockNotice} />
       </>
     );
   }
@@ -3050,6 +3107,13 @@ function App() {
           </div>
         </div>
       </header>
+
+      {/* Relógio do computador errado: explica por que o app pode cair e não mostrar pedidos. */}
+      {clockNotice && (
+        <div className="px-6 pt-3">
+          <ClockSkewWarning notice={clockNotice} />
+        </div>
+      )}
 
       {/* Aviso de impressão (o app fica na bandeja; erro só no console passa batido) */}
       {printError && (
@@ -3347,7 +3411,32 @@ function AlreadyOpenNotice({ onClose }: { onClose: () => void }) {
 }
 
 // Login Screen Component
-function LoginScreen({ onLogin, error }: { onLogin: (email: string, password: string) => void; error: string | null }) {
+/** Aviso de data/hora do computador errada — o MESMO texto do painel (`clock-skew.ts`). */
+function ClockSkewWarning({ notice }: { notice: ClockSkewNotice }) {
+  return (
+    <div
+      role="alert"
+      className="bg-red-900/60 border border-red-500 text-red-100 p-3 rounded-lg text-sm text-left max-w-md space-y-1"
+    >
+      <p className="font-bold flex items-center gap-2">
+        <Clock className="w-4 h-4 shrink-0" />
+        {notice.title}
+      </p>
+      <p>{notice.detail}</p>
+      <p>{notice.howToFix}</p>
+    </div>
+  );
+}
+
+function LoginScreen({
+  onLogin,
+  error,
+  clockNotice,
+}: {
+  onLogin: (email: string, password: string) => void;
+  error: string | null;
+  clockNotice: ClockSkewNotice | null;
+}) {
   // Abre com o último login já digitado: quem saiu (ou perdeu a sessão) volta clicando
   // UMA vez em Entrar. O inicializador é preguiçoso — ler o localStorage a cada render
   // seria trabalho repetido e, pior, sobrescreveria o que o lojista estivesse digitando.
@@ -3359,6 +3448,12 @@ function LoginScreen({ onLogin, error }: { onLogin: (email: string, password: st
     <div className="min-h-screen bg-gray-900 flex items-center justify-center">
       <div className="bg-gray-800 p-8 rounded-xl w-96">
         <h1 className="text-2xl font-bold text-center mb-6 text-orange-500">KyberFood Impressora</h1>
+
+        {clockNotice && (
+          <div className="mb-4">
+            <ClockSkewWarning notice={clockNotice} />
+          </div>
+        )}
         
         {error && (
           <div className="bg-red-900/50 border border-red-500 text-red-200 p-3 rounded-lg mb-4">
@@ -3426,11 +3521,20 @@ function OrderDetails({
           papel, e nos dois o tipo precisa ser a primeira coisa que salta aos olhos. */}
       <div
         className={`rounded-lg p-3 mb-4 text-center text-xl font-bold tracking-wide ${
-          isPickupOrder(order) ? 'bg-amber-600 text-white' : 'bg-blue-700 text-white'
+          orderTableName(order) ? 'bg-emerald-700 text-white' : isPickupOrder(order) ? 'bg-amber-600 text-white' : 'bg-blue-700 text-white'
         }`}
       >
-        {isPickupOrder(order) ? 'RETIRADA NO BALCÃO' : 'ENTREGA'}
+        {/* Mesma regra da comanda (receiptOrderTypeLabel): pedido da mesa mostra a mesa. */}
+        {orderTableName(order) ? orderTableName(order).toUpperCase() : isPickupOrder(order) ? 'RETIRADA NO BALCÃO' : 'ENTREGA'}
       </div>
+
+      {/* HORA MARCADA em destaque, como na comanda: o pedido agendado não pode ser produzido
+          na hora por engano. */}
+      {order.scheduled_at && (
+        <div className="rounded-lg p-3 mb-4 text-center text-2xl font-extrabold tracking-wide bg-red-600 text-white">
+          HORA MARCADA: {formatOrderDateTime(order.scheduled_at)}
+        </div>
+      )}
       
       {/* Customer Info */}
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -3881,6 +3985,13 @@ const DELIVERY_RECEIPT_LABEL = '*** ENTREGA ***';
 // ESPELHA RECEIPT_EMPHASIS_PREFIX do web e EMPHASIS_PREFIX (0x02) do src-tauri/src/main.rs.
 const RECEIPT_EMPHASIS_PREFIX = '\u0002';
 
+// Marca de linha ENORME (negrito + LARGURA e altura dupla na térmica): só a HORA MARCADA.
+// A linha já é montada com METADE das colunas, por isso a largura dupla não estoura o papel.
+// ESPELHA RECEIPT_HUGE_PREFIX do web e HUGE_PREFIX (0x03) do src-tauri/src/main.rs.
+const RECEIPT_HUGE_PREFIX = '\u0003';
+// ESPELHA SCHEDULED_RECEIPT_LABEL de src/lib/desktop-print-config.ts.
+const SCHEDULED_RECEIPT_LABEL = 'HORA MARCADA';
+
 // ESPELHAM os rótulos de mesmo nome em src/lib/desktop-print-config.ts.
 const ORDER_NOTES_RECEIPT_LABEL = '*** OBSERVACAO DO PEDIDO ***';
 const ITEM_NOTE_RECEIPT_PREFIX = '  >> OBS: ';
@@ -3889,6 +4000,7 @@ const ITEM_NOTE_RECEIPT_PREFIX = '  >> OBS: ';
 interface ReceiptLine {
   text: string;
   emphasis?: boolean;
+  huge?: boolean;
 }
 
 // ESPELHA GIFT_RECEIPT_LABEL de src/lib/order-gifts.ts no app web. Item de cortesia sai com
@@ -3904,6 +4016,26 @@ function isPickupOrder(order: Pick<Order, 'delivery_address' | 'notes' | 'metada
   if (flag === 'delivery') return false;
   const pickupText = /^\s*retirada no balc[aã]o/i;
   return pickupText.test(String(order.delivery_address || '')) || pickupText.test(String(order.notes || ''));
+}
+
+// Nome da MESA do pedido feito no salão (QR Code ou garçom), ou ''. ESPELHA readOrderTable e
+// tableDisplayName de src/lib/dining/tables.ts: "12" vira "Mesa 12"; "Varanda 3" fica.
+function orderTableName(order: Pick<Order, 'metadata'>): string {
+  const table = order.metadata?.table;
+  if (!table || typeof table !== 'object') return '';
+  const id = typeof table.id === 'string' ? table.id : '';
+  const label = typeof table.label === 'string' ? table.label.replace(/\s+/g, ' ').trim().slice(0, 30).trim() : '';
+  if (!id || !label) return '';
+  return /^\d+[A-Za-z]?$/.test(label) ? `Mesa ${label}` : label;
+}
+
+// O TIPO do pedido no topo da comanda. Pedido da MESA sai com o nome da mesa: ele é gravado
+// como retirada (consumo no local), e "RETIRADA" faria a cozinha embalar para viagem o prato
+// que vai para a mesa. ESPELHA receiptOrderTypeLabel de src/lib/desktop-print-config.ts.
+function receiptOrderTypeLabel(order: Pick<Order, 'delivery_address' | 'notes' | 'metadata'>): string {
+  const tableName = orderTableName(order);
+  if (tableName) return `*** ${tableName.toUpperCase()} ***`;
+  return isPickupOrder(order) ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL;
 }
 
 // Sabores da pizza chegam como complementos do grupo "Sabores". Quando há mais de
@@ -3984,7 +4116,7 @@ type ReceiptBlock =
   // nem conhece a flag `wrap` que existia aqui). Quem impede um nome/endereço/observação
   // forjado de virar uma linha "STATUS: PAGO" é RECEIPT_CONTINUATION_PREFIX, não a ausência
   // de quebra — ver sanitize-text.test.ts no monorepo.
-  | { kind: 'text'; text: string; align?: 'left' | 'center' | 'right'; strong?: boolean; big?: boolean; indent?: number }
+  | { kind: 'text'; text: string; align?: 'left' | 'center' | 'right'; strong?: boolean; big?: boolean; huge?: boolean; indent?: number }
   | { kind: 'row'; left: string; right: string; strong?: boolean; indent?: number }
   | { kind: 'rule'; double?: boolean }
   | { kind: 'space' };
@@ -4012,6 +4144,18 @@ function layoutToLines(blocks: ReceiptBlock[], width: number): ReceiptLine[] {
       case 'space':
         break;
       case 'text': {
+        if (block.huge) {
+          // Largura dupla: quebra e centraliza em METADE das colunas.
+          const half = Math.max(1, Math.floor(width / 2));
+          const wrapped = wrapText(block.text, half, '', '');
+          if (wrapped.length === 0) wrapped.push('');
+          for (const raw of wrapped) {
+            const t = raw.trim().slice(0, half);
+            const spaces = Math.max(0, Math.floor((half - t.length) / 2));
+            lines.push({ text: ' '.repeat(spaces) + t, emphasis: true, huge: true });
+          }
+          break;
+        }
         const emphasis = Boolean(block.strong || block.big);
         const prefix = INDENT_TEXT.repeat(block.indent || 0);
         // A MARCA SÓ VALE NO ALINHAMENTO À ESQUERDA, e é onde ela protege: título centralizado
@@ -4070,12 +4214,18 @@ function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): Re
   rule(true);
   // TIPO DO PEDIDO, EM CIMA E EM DESTAQUE. Antes a retirada só aparecia no MEIO da ficha,
   // no lugar do endereço, e a entrega não aparecia em lugar nenhum.
-  text({ text: pickup ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL, align: 'center', strong: true, big: true });
+  text({ text: receiptOrderTypeLabel(order), align: 'center', strong: true, big: true });
+  // HORA MARCADA, ENORME e logo abaixo do tipo do pedido (antes era uma linha de "agendado" no
+  // corpo de sempre e a equipe não lia). ESPELHA buildReceiptLayout do web.
+  if (order.scheduled_at) {
+    rule(true);
+    text({ text: SCHEDULED_RECEIPT_LABEL, align: 'center', strong: true, big: true, huge: true });
+    text({ text: formatOrderDateTime(order.scheduled_at, store.timezone), align: 'center', strong: true, big: true, huge: true });
+  }
   rule(true);
   const orderLabel = `PEDIDO #${orderDisplayNumber(order)}`;
   if (config.showDateTime) row({ left: orderLabel, right: formatOrderDateTime(order.created_at, store.timezone), strong: true });
   else text({ text: orderLabel, strong: true });
-  if (order.scheduled_at) text({ text: `AGENDADO P/: ${formatOrderDateTime(order.scheduled_at, store.timezone)}`, strong: true });
   rule();
   text({ text: `CLIENTE: ${receiptCustomerName(order.customer_name)}` });
   if (config.showCustomerPhone && order.customer_phone) text({ text: `FONE: ${formatReceiptPhone(order.customer_phone)}` });
@@ -4175,7 +4325,9 @@ function buildReceiptDoc(order: Order, store: Store, config: PrintConfig): Recei
 // prefixadas pela marca de controle que o Rust converte em ESC/POS.
 // ESPELHA encodeReceiptText do app web.
 function encodeReceiptText(doc: ReceiptLine[]): string {
-  return doc.map((l) => (l.emphasis ? RECEIPT_EMPHASIS_PREFIX + l.text : l.text)).join('\n');
+  return doc
+    .map((l) => (l.huge ? RECEIPT_HUGE_PREFIX + l.text : l.emphasis ? RECEIPT_EMPHASIS_PREFIX + l.text : l.text))
+    .join('\n');
 }
 
 // Escapa strings vindas do pedido (nome do cliente, observações etc.) antes de
@@ -4199,8 +4351,15 @@ function generateReceiptHtml(order: Order, store: Store): string {
   lines.push('<hr>');
   lines.push(
     `<div style="text-align: center; font-weight: bold; font-size: 16px;">` +
-      `${escapeHtml(isPickupOrder(order) ? PICKUP_RECEIPT_LABEL : DELIVERY_RECEIPT_LABEL)}</div>`,
+      `${escapeHtml(receiptOrderTypeLabel(order))}</div>`,
   );
+  if (order.scheduled_at) {
+    lines.push('<hr>');
+    lines.push(
+      `<div style="text-align: center; font-weight: bold; font-size: 24px;">${SCHEDULED_RECEIPT_LABEL}<br>` +
+        `${escapeHtml(formatOrderDateTime(order.scheduled_at, store.timezone))}</div>`,
+    );
+  }
   lines.push('<hr>');
   lines.push(`<div><strong>PEDIDO #${escapeHtml(orderDisplayNumber(order))}</strong></div>`);
   lines.push(`<div>${escapeHtml(formatOrderDateTime(order.created_at, store.timezone))}</div>`);
