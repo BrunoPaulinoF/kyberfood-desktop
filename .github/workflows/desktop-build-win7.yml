@@ -152,8 +152,8 @@ jobs:
           # da versão mais nova para a mais antiga (o linker usa o primeiro `windows.lib` que achar).
           cargo metadata --format-version 1 > ../cargo-metadata.json
           mkdir -p .cargo
-          # O Tauri recusa `--target` de alvo "tier 3" (confere na lista do rustup), mas lê o alvo
-          # do .cargo/config.toml sem conferir — e é por ele que acha a pasta do .exe.
+          # Runtime de C estático e biblioteca padrão própria SÓ para o alvo Windows 7 (o alvo vai
+          # no `--target` do passo de build).
           node -e "
             const fs = require('fs');
             const path = require('path');
@@ -169,9 +169,6 @@ jobs:
             for (const dir of libDirs) flags.push('-L', 'native=' + dir);
             const target = process.env.WIN7_TARGET;
             const toml = [
-              '[build]',
-              'target = ' + JSON.stringify(target),
-              '',
               '[target.' + target + ']',
               'rustflags = ' + JSON.stringify(flags),
               '',
@@ -197,7 +194,20 @@ jobs:
           EOF
 
       - name: Build do instalador (Windows 7, 32 bits)
-        run: npx tauri build
+        shell: bash
+        run: |
+          set -e
+          # O `--target` é o que diz ao Tauri que o instalador é de 32 bits (sem ele o pacote sai
+          # "x64" e RECUSARIA Windows de 32 bits). Só que o Tauri confere o `--target` na lista do
+          # rustup, onde o alvo Windows 7 ("tier 3") não aparece, e aborta. Sem o rustup no PATH
+          # essa conferência é pulada: cargo e rustc vêm direto da pasta do Rust fixado acima.
+          SYSROOT_BIN="$(cygpath -u "$(rustc --print sysroot)")/bin"
+          export PATH="$SYSROOT_BIN:$(echo "$PATH" | tr ':' '\n' | grep -v '/\.cargo/bin' | paste -sd: -)"
+          if command -v rustup >/dev/null 2>&1; then
+            echo "::error::O rustup continua no PATH ($(command -v rustup)); o Tauri recusaria o alvo Windows 7."
+            exit 1
+          fi
+          npx tauri build --target "$WIN7_TARGET"
 
       - name: Conferir que o app abre no Windows 7 (tabela de importação do .exe)
         shell: bash
