@@ -1,0 +1,258 @@
+name: Build App Desktop (Windows 7)
+
+# Gera o instalador da versão para PC ANTIGO — Windows 7, 8 e 8.1, de 32 ou 64 bits — e o publica
+# numa Release SEPARADA (`desktop-win7`). O instalador de sempre (desktop-build.yml) é de 64 bits e
+# compilado para Windows 10+: num Windows de 32 bits o atalho mostra "Este aplicativo não pode ser
+# executado em seu PC", e num Windows 7 o .exe nem carrega.
+#
+# Fonte deste arquivo: o MONOREPO (kyberfood-desktop/.github/workflows/), espelhado para cá pelo
+# sync junto com o app. A trava que lê este arquivo é src/lib/desktop-win7-build.test.ts de lá.
+#
+# O QUE MUDA em relação ao build principal (e por quê):
+#   - alvo `i686-win7-windows-msvc`: 32 bits (roda em Windows de 32 e de 64 bits) e a biblioteca
+#     padrão do Rust no modo Windows 7. O alvo comum da Microsoft no Rust exige Windows 10.
+#     Esse alvo não vem pronto no rustup: a biblioteca padrão é compilada aqui (`build-std`, que
+#     no Rust estável precisa de RUSTC_BOOTSTRAP=1);
+#   - runtime de C ESTÁTICO (`+crt-static`): sem depender do "Visual C++ Redistributable" nem do
+#     UCRT, que um Windows 7 desatualizado não tem;
+#   - avisos do Windows (balões) DESLIGADOS: a biblioteca deles importa WinRT (Windows 8+) e o
+#     .exe inteiro deixaria de abrir. No Windows 7 eles nunca funcionaram de qualquer forma;
+#   - atualização automática DESLIGADA: o pacote assinado do latest.json é o de 64 bits. O app
+#     Windows 7 lê o manifesto PRÓPRIO (latest-win7.json) e só oferece o instalador Windows 7;
+#   - o WebView2 vai DENTRO do instalador (embedBootstrapper). No Windows 7/8 a Microsoft instala
+#     a versão 109, a última para eles; o build principal baixa o instalador na hora.
+#   - antes de publicar, `.github/scripts/win7-exe-check.mjs` lê a tabela de importação do .exe e
+#     REPROVA o build se aparecer função que o Windows 7 não tem. É a prova que temos sem um
+#     Windows 7 na esteira.
+#
+# A Release `desktop-win7` é PRÉ-LANÇAMENTO e nunca a "latest": o link `releases/latest/...`
+# (latest.json e KyberFood-Setup.exe) continua sendo o do app principal para todas as lojas.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versão (ex.: 1.0.46). Em branco = a mesma do app principal publicado.'
+        required: false
+        default: ''
+  # Depois de cada build do app principal na main: mesmo commit, mesma versão.
+  workflow_run:
+    workflows: ['Build App Desktop (Windows)']
+    types: [completed]
+    branches: [main]
+  # Push nesta branch gera SÓ a versão Windows 7, sem publicar versão nova do app principal para
+  # todas as lojas (o workflow principal só roda na main).
+  push:
+    branches: [win7-build]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-build-win7
+  cancel-in-progress: false
+
+jobs:
+  build-win7:
+    # Build principal que falhou não gera versão Windows 7: seria de um código que não foi ao ar.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    env:
+      WIN7_TARGET: i686-win7-windows-msvc
+      # build-std no Rust estável (o alvo Windows 7 não tem biblioteca padrão pronta).
+      RUSTC_BOOTSTRAP: '1'
+      # O Tauri liga por padrão o vcruntime estático com UCRT DINÂMICO (api-ms-win-crt-*.dll).
+      # Aqui o runtime inteiro é estático (`+crt-static`, no .cargo/config.toml abaixo).
+      STATIC_VCRUNTIME: 'false'
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          # No workflow_run, o MESMO commit que o build principal acabou de publicar.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolver versão do build
+        id: version
+        shell: bash
+        # Entrada digitada chega por `env:` (dado, nunca código) — mesmo cuidado do build principal.
+        env:
+          VERSAO_INFORMADA: ${{ github.event.inputs.version }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -e
+          if [ -n "$VERSAO_INFORMADA" ]; then
+            V="$VERSAO_INFORMADA"
+          else
+            # A MESMA versão do app principal publicado. Nunca maior: o painel usa a maior versão
+            # da frota como referência, e uma versão Windows 7 à frente marcaria todas as lojas
+            # como atrasadas.
+            curl -fsSL "https://github.com/$REPO_NAME/releases/latest/download/latest.json" -o latest_check.json || true
+            V=$(node -e "try{process.stdout.write(String(JSON.parse(require('fs').readFileSync('latest_check.json','utf8')).version||''))}catch(e){}")
+            rm -f latest_check.json
+          fi
+          # Sem versão confiável o build PARA: inventar uma (ex.: número do run) daria um app que
+          # pede atualização para sempre ou que passa à frente da frota.
+          if ! echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Versão inválida ou não encontrada no latest.json do app principal. Rode de novo informando a versão (formato 1.2.3)."
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Versão resolvida: $V"
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Rust (versão FIXA, com o código-fonte da biblioteca padrão)
+        # Versão fixa porque o alvo Windows 7 é "tier 3": não é testado a cada versão do Rust.
+        # Esta combinação (Rust + Cargo.lock) foi compilada e linkada para i686-win7-windows-msvc.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          components: rust-src
+
+      - name: Cache do Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: win7
+
+      - name: Instalar dependências do frontend
+        run: npm install
+
+      - name: Aplicar a versão e a configuração da versão Windows 7
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          node -e "const fs=require('fs');const p='package.json';const j=JSON.parse(fs.readFileSync(p));j.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const j = JSON.parse(fs.readFileSync(p));
+            j.package.version = process.env.VERSION;
+            j.tauri.updater.active = false;
+            j.tauri.updater.pubkey = '';
+            j.tauri.allowlist.notification = { all: false };
+            j.tauri.bundle.targets = ['nsis'];
+            j.tauri.bundle.windows.webviewInstallMode = { type: 'embedBootstrapper', silent: true };
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+          "
+
+      - name: Configurar o Cargo para o alvo Windows 7 (32 bits)
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set -e
+          # As crates `windows_i686_msvc` antigas (0.37/0.39/0.42/0.48) só dizem ao linker onde
+          # está o `windows.lib` delas quando o alvo é EXATAMENTE i686-pc-windows-msvc; para o alvo
+          # Windows 7 o link falharia com "não encontrei windows.lib". As pastas vão explícitas,
+          # da versão mais nova para a mais antiga (o linker usa o primeiro `windows.lib` que achar).
+          cargo metadata --format-version 1 > ../cargo-metadata.json
+          mkdir -p .cargo
+          # O Tauri recusa `--target` de alvo "tier 3" (confere na lista do rustup), mas lê o alvo
+          # do .cargo/config.toml sem conferir — e é por ele que acha a pasta do .exe.
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const meta = JSON.parse(fs.readFileSync('../cargo-metadata.json', 'utf8'));
+            const num = (v) => v.split('.').map(Number);
+            const newer = (a, b) => { const x = num(a), y = num(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0; };
+            const libDirs = meta.packages
+              .filter((p) => p.name === 'windows_i686_msvc')
+              .sort((a, b) => newer(a.version, b.version))
+              .map((p) => path.join(path.dirname(p.manifest_path), 'lib'));
+            if (libDirs.length === 0) { console.error('nenhuma crate windows_i686_msvc no Cargo.lock'); process.exit(1); }
+            const flags = ['-C', 'target-feature=+crt-static'];
+            for (const dir of libDirs) flags.push('-L', 'native=' + dir);
+            const target = process.env.WIN7_TARGET;
+            const toml = [
+              '[build]',
+              'target = ' + JSON.stringify(target),
+              '',
+              '[target.' + target + ']',
+              'rustflags = ' + JSON.stringify(flags),
+              '',
+              '[unstable]',
+              'build-std = [\"std\", \"panic_abort\"]',
+              '',
+            ].join('\n');
+            fs.writeFileSync('.cargo/config.toml', toml);
+            console.log(toml);
+          "
+
+      - name: Gerar arquivo .env de produção
+        # Mesmo .env do build principal + VITE_KYBERFOOD_WIN7=1, que liga no App.tsx o canal de
+        # atualização da versão Windows 7. Heredoc CITADO pelo mesmo motivo do build principal
+        # (o segredo é texto, nunca é expandido pelo shell).
+        shell: bash
+        run: |
+          cat > .env <<'EOF'
+          VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_API_URL=${{ secrets.VITE_API_URL }}
+          VITE_KYBERFOOD_WIN7=1
+          EOF
+
+      - name: Build do instalador (Windows 7, 32 bits)
+        run: npx tauri build
+
+      - name: Conferir que o app abre no Windows 7 (tabela de importação do .exe)
+        shell: bash
+        run: node .github/scripts/win7-exe-check.mjs "src-tauri/target/$WIN7_TARGET/release/KyberFood.exe"
+
+      - name: Renomear o instalador para nome fixo
+        shell: bash
+        run: |
+          set -e
+          nsis=$(ls src-tauri/target/$WIN7_TARGET/release/bundle/nsis/*.exe | head -n1)
+          # O nome que o Tauri dá ao instalador diz a arquitetura: tem que ser x86 (32 bits).
+          case "$nsis" in
+            *_x86-setup.exe) ;;
+            *) echo "::error::O instalador gerado não é de 32 bits: $nsis"; exit 1 ;;
+          esac
+          cp "$nsis" "KyberFood-Setup-Win7.exe"
+          echo "Instalador pronto: KyberFood-Setup-Win7.exe"
+
+      - name: Gerar manifesto latest-win7.json
+        # Lido SÓ pelo app Windows 7 (App.tsx). Nome diferente de latest.json de propósito: se um
+        # dia esta Release virasse a "latest" por engano, a frota não leria um manifesto que a
+        # mandaria instalar a versão Windows 7.
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -e
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") node -e "
+            const fs = require('fs');
+            const base = 'https://github.com/' + process.env.REPO_NAME + '/releases/download/desktop-win7';
+            const manifest = {
+              version: process.env.VERSION,
+              pub_date: process.env.PUB_DATE,
+              notes: 'Nova versão do KyberFood Impressora para Windows 7 disponível.',
+              url_win: base + '/KyberFood-Setup-Win7.exe',
+            };
+            fs.writeFileSync('latest-win7.json', JSON.stringify(manifest, null, 2) + '\n');
+          "
+          cat latest-win7.json
+
+      - name: Publicar Release "desktop-win7" (separada; nunca a "latest")
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-win7
+          target_commitish: ${{ github.event.workflow_run.head_sha || github.sha }}
+          name: KyberFood Impressora para Windows 7/8 (32 bits)
+          body: |
+            Versão para computador com Windows 7, 8 ou 8.1, ou com Windows de 32 bits.
+            Versão: ${{ steps.version.outputs.version }}
+            Baixe o KyberFood-Setup-Win7.exe abaixo.
+            O Windows 7 precisa estar com o Service Pack 1 e as atualizações instaladas.
+          # NUNCA a "latest": o link releases/latest/... é o do app principal de todas as lojas.
+          prerelease: true
+          make_latest: false
+          files: |
+            KyberFood-Setup-Win7.exe
+            latest-win7.json

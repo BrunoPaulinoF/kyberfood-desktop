@@ -106,10 +106,24 @@ async function httpJson<T = any>(
   return { ok: res.ok, status: res.status, data: data as T | null };
 }
 
+// Versão para PC ANTIGO (Windows 7/8/8.1, 32 bits), gerada pelo workflow
+// `.github/workflows/desktop-build-win7.yml` com VITE_KYBERFOOD_WIN7=1. Ela tem canal de
+// atualização PRÓPRIO (Release `desktop-win7`, manifesto `latest-win7.json`): o manifesto do app
+// principal aponta para o instalador de 64 bits, que não abre nesse PC — oferecer ele seria
+// trocar um app que funciona por um que não abre. Os nomes espelham src/lib/desktop-win7.ts do
+// monorepo. Trava: src/lib/desktop-win7-build.test.ts.
+const IS_WIN7_BUILD = import.meta.env.VITE_KYBERFOOD_WIN7 === '1';
+const WIN7_RELEASE_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/download/desktop-win7';
+const APP_FLAVOR_LABEL = IS_WIN7_BUILD ? ' (Windows 7)' : '';
+
 // Manifesto publicado pelo GitHub Actions a cada build do app desktop.
 // O app o consulta para saber se há uma versão mais nova (atualização opcional).
-const UPDATE_MANIFEST_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/latest.json';
-const FALLBACK_DOWNLOAD_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/KyberFood-Setup.exe';
+const UPDATE_MANIFEST_URL = IS_WIN7_BUILD
+  ? `${WIN7_RELEASE_URL}/latest-win7.json`
+  : 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/latest.json';
+const FALLBACK_DOWNLOAD_URL = IS_WIN7_BUILD
+  ? `${WIN7_RELEASE_URL}/KyberFood-Setup-Win7.exe`
+  : 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/KyberFood-Setup.exe';
 
 type UpdateManifest = { version?: string; url_win?: string | null; notes?: string | null };
 
@@ -122,11 +136,14 @@ type UpdateManifest = { version?: string; url_win?: string | null; notes?: strin
  * atualizado", que foi exatamente o problema relatado.
  */
 async function fetchLatestManifest(): Promise<UpdateManifest | null> {
-  try {
-    const res = await httpJson<UpdateManifest>(`${apiUrl}/api/desktop/latest-version`);
-    if (res.ok && res.data?.version) return res.data;
-  } catch (err) {
-    console.warn('Versão publicada indisponível pelo servidor do KyberFood:', err);
+  // A versão Windows 7 pula o servidor: ele responde o manifesto do app PRINCIPAL (64 bits).
+  if (!IS_WIN7_BUILD) {
+    try {
+      const res = await httpJson<UpdateManifest>(`${apiUrl}/api/desktop/latest-version`);
+      if (res.ok && res.data?.version) return res.data;
+    } catch (err) {
+      console.warn('Versão publicada indisponível pelo servidor do KyberFood:', err);
+    }
   }
 
   const res = await httpJson<UpdateManifest>(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`);
@@ -153,6 +170,9 @@ async function fetchLatestManifest(): Promise<UpdateManifest | null> {
  * sobe hoje. Esta função é uma melhoria opcional, nunca um caminho crítico.
  */
 async function installUpdateOnLaunch(): Promise<boolean> {
+  // Versão Windows 7: o pacote do updater nativo é o de 64 bits. Atualiza só pelo botão,
+  // baixando o instalador Windows 7.
+  if (IS_WIN7_BUILD) return false;
   try {
     const { shouldUpdate } = await checkUpdate();
     if (!shouldUpdate) return false;
@@ -1541,9 +1561,9 @@ function App() {
 
     // Com o updater nativo ligado, o botão INSTALA e reinicia — o lojista não precisa
     // baixar nem passar pelo instalador do Windows. Aqui reiniciar é seguro: foi ele quem
-    // pediu, na hora que escolheu.
+    // pediu, na hora que escolheu. (Versão Windows 7: nunca — o pacote nativo é o de 64 bits.)
     try {
-      const { shouldUpdate } = await checkUpdate();
+      const { shouldUpdate } = IS_WIN7_BUILD ? { shouldUpdate: false } : await checkUpdate();
       if (shouldUpdate) {
         setUpdateCheck({ state: 'installing' });
         await writeDeviceStateFile();
@@ -3021,12 +3041,12 @@ function App() {
                 : updateCheck.state === 'checking'
                 ? 'Verificando…'
                 : updateCheck.state === 'up-to-date'
-                  ? `v${appVersion} · atualizado`
+                  ? `v${appVersion}${APP_FLAVOR_LABEL} · atualizado`
                   : updateCheck.state === 'error'
                     ? 'Não consegui verificar'
                     : updateInfo
-                      ? `v${appVersion} · atualização disponível`
-                      : `v${appVersion || '—'}`}
+                      ? `v${appVersion}${APP_FLAVOR_LABEL} · atualização disponível`
+                      : `v${appVersion || '—'}${APP_FLAVOR_LABEL}`}
             </button>
           </div>
           
