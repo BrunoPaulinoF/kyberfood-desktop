@@ -110,7 +110,10 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.0
-          components: rust-src
+          # rust-src: a biblioteca padrão é compilada aqui. rustfmt: o build do webview2-com-sys
+          # chama `rustfmt` pelo PATH, e no passo de build o PATH só tem a pasta do Rust (sem o
+          # rustup), então ele precisa estar instalado nela.
+          components: rust-src, rustfmt
 
       - name: Cache do Rust
         uses: swatinem/rust-cache@v2
