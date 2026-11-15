@@ -15,8 +15,10 @@
  * arquivo (no diretório de configuração, que o instalador não toca) só é lido quando o
  * `localStorage` volta VAZIO, que é exatamente o cenário da reinstalação.
  *
- * Proteção: a mesma de antes — a pasta de perfil do usuário do Windows. Não há segredo
- * novo aqui; é o mesmo conteúdo que já estava no `localStorage`, num lugar que sobrevive.
+ * Proteção: este arquivo só COPIA o que está no `localStorage`, byte a byte. As duas chaves
+ * que carregam senha chegam aqui já CIFRADAS pela DPAPI do Windows (`credential-vault.ts`);
+ * a reserva nunca decifra nem recodifica nada. Valor antigo em base64 que ainda estiver aqui
+ * é trocado no arranque (`scrubPlaintextCopies`).
  */
 import { invoke } from '@tauri-apps/api/tauri';
 
@@ -35,7 +37,7 @@ export const LOGIN_PREFILL_STORAGE_KEY = 'kyberfood.desktop.lastLogin';
 type DeviceState = { settings?: unknown; credentials?: string; loginPrefill?: string };
 
 /** Lê a reserva. Arquivo ausente NÃO é erro: é o primeiro uso do app. */
-async function readDeviceStateFile(): Promise<DeviceState | null> {
+export async function readDeviceStateFile(): Promise<DeviceState | null> {
   try {
     const raw = await invoke<string | null>('read_device_state');
     if (!raw) return null;

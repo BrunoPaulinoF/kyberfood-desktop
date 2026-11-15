@@ -63,6 +63,22 @@ baixar a versão nova sem nenhuma alteração no painel. Instalar por cima da ve
 funciona. Esta versão passa a enviar o token de sessão nas chamadas à API — a versão
 anterior recebia 401 ao listar/atualizar pedidos.
 
+## Versão para Windows 7 (PC antigo)
+
+Computador com Windows 7, 8 ou 8.1, ou com Windows de 32 bits, não roda o instalador de sempre
+(ele é de 64 bits e feito para Windows 10+). Para eles existe um instalador próprio,
+`KyberFood-Setup-Win7.exe`, gerado pelo workflow `.github/workflows/desktop-build-win7.yml`:
+
+- roda sozinho depois de cada build do app principal na `main` (mesma versão, mesmo código);
+- também roda pela aba **Actions → Build App Desktop (Windows 7) → Run workflow**, ou com um push
+  na branch `win7-build` (gera só a versão Windows 7, sem lançar versão nova para as lojas);
+- publica na Release `desktop-win7` (pré-lançamento, nunca a "latest");
+- o lojista baixa pelo painel: Integrações → "versão para Windows 7"
+  (`/api/desktop/download?versao=win7`).
+
+O Windows 7 precisa estar com o Service Pack 1 e as atualizações. Os balões de aviso do Windows
+não aparecem nessa versão (o som e a impressão funcionam igual).
+
 ## Logo do app
 
 A logo é gerada do arquivo-fonte `src-tauri/icons/icon.svg`. Depois de editá-lo, rode

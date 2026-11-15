@@ -5,6 +5,9 @@ mod receipt_raster;
 // Impressão pela API do Windows, sem PowerShell (ver o cabeçalho do arquivo).
 #[cfg(target_os = "windows")]
 mod win_print;
+// Credencial do relogin cifrada pela DPAPI do Windows (ver o cabeçalho do arquivo).
+#[cfg(target_os = "windows")]
+mod win_secret;
 
 use printpdf::*;
 use serde::{Deserialize, Serialize};
@@ -416,6 +419,48 @@ fn print_receipt_graphic_impl(
     }
 }
 
+/// Imprime UMA via do CUPOM FISCAL (DANFE NFC-e) em MODO GRÁFICO: linhas em grade de colunas
+/// (bloco `mono`) e o QR Code desenhado como imagem (bloco `qr`, matriz pronta do front), com
+/// corte no fim (`build_escpos_graphic`). Quem chama faz uma chamada por via.
+///
+/// SEM CAIR NO MODO TEXTO, ao contrário da comanda: a fonte da impressora não desenha o QR, e
+/// cupom fiscal sem QR não vale como documento. Falhou o raster → erro → o job fica `failed` e
+/// o painel oferece o plano B (cupom no navegador / link pelo WhatsApp).
+///
+/// Mesmo cadeado e mesma thread da comanda (`async` + `PRINT_LOCK`): cupom e comanda saem na
+/// MESMA impressora, uma impressão por vez, sem prender a janela.
+#[tauri::command(async)]
+fn print_fiscal_receipt(printer_name: Option<String>, layout: String, width: Option<i32>) -> Result<(), String> {
+    let _guard = lock_printing();
+    print_fiscal_receipt_impl(printer_name, layout, width)
+}
+
+/// Fonte base passada ao raster: o cupom só usa `mono`/`qr`/`rule`, que têm medida própria;
+/// o valor só mexe no `space` (que o cupom não emite).
+const FISCAL_RECEIPT_FONT_PT: f64 = 9.0;
+
+fn print_fiscal_receipt_impl(printer_name: Option<String>, layout: String, width: Option<i32>) -> Result<(), String> {
+    let printer = match printer_name {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return Err("Nenhuma impressora configurada".to_string()),
+    };
+    let receipt_width_chars = if width == Some(32) { 32 } else { 48 };
+    let bytes = receipt_raster::build_escpos_graphic(&layout, receipt_width_chars, FISCAL_RECEIPT_FONT_PT)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        win_print::send_raw(&printer, &bytes)
+    }
+
+    // No desenvolvimento (macOS/Linux) não há spooler RAW, e o PDF de texto não leva o QR:
+    // valida o layout (acima) e recusa em voz alta, em vez de "imprimir" um cupom sem QR.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (printer, bytes);
+        Err("Cupom fiscal so imprime pelo spooler do Windows (modo grafico)".to_string())
+    }
+}
+
 // O COMANDO `test_printer` SAIU DAQUI, e ele era um SEGUNDO montador de comanda.
 //
 // Ele mandava quatro linhas fixas ("TESTE DE IMPRESSAO / Impressora funcionando!") — texto
@@ -541,6 +586,64 @@ fn write_device_state_file(contents: &str) -> Result<(), String> {
 #[tauri::command]
 fn write_device_state(contents: String) -> Result<(), String> {
     write_device_state_file(&contents)
+}
+
+/// Apaga a reserva do lugar ANTIGO (`%APPDATA%\<identificador>`), que guardava a senha em
+/// base64 e só era lida para migrar. Só apaga quando a reserva do lugar NOVO existe — sem
+/// ela, a antiga é a única cópia e fica onde está. A interface só chama isto depois de
+/// conferir que a reserva nova já está cifrada (`scrubPlaintextCopies`).
+#[tauri::command]
+fn remove_legacy_device_state(app: tauri::AppHandle) -> Result<(), String> {
+    let path = device_state_path()?;
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Some(legacy) = legacy_device_state_path(&app) else {
+        return Ok(());
+    };
+    if legacy == path {
+        return Ok(());
+    }
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Cifra um segredo para o usuário do Windows (DPAPI). Fora do Windows (só ambiente de
+/// desenvolvimento) devolve erro, e a interface mantém o formato de antes.
+///
+/// `async`: a DPAPI pode ir ao disco (perfil do usuário); comando síncrono roda na thread
+/// PRINCIPAL e congelaria a janela junto.
+#[tauri::command(async)]
+fn protect_secret(plain: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        win_secret::protect(&plain)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = plain;
+        Err("cifra indisponivel fora do Windows".to_string())
+    }
+}
+
+/// Abre o que `protect_secret` cifrou. Falha (outra conta do Windows, outro PC, conteúdo
+/// estragado) é `Err` — a interface trata como "sem credencial", nunca como texto válido.
+#[tauri::command(async)]
+fn unprotect_secret(blob: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        win_secret::unprotect(&blob)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = blob;
+        Err("cifra indisponivel fora do Windows".to_string())
+    }
 }
 
 /// Sinal de vida da interface. Só carimba a hora — barato o bastante para rodar a cada 15s.
@@ -670,9 +773,13 @@ fn main() {
             get_printers,
             print_receipt,
             print_receipt_graphic,
+            print_fiscal_receipt,
             renderer_alive,
             read_device_state,
-            write_device_state
+            write_device_state,
+            remove_legacy_device_state,
+            protect_secret,
+            unprotect_secret
         ])
         .setup(|app| {
             // Garante que o app sempre inicie junto com o Windows (na bandeja).

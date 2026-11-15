@@ -4,6 +4,8 @@ node_modules/
 # Build
 dist/
 src-tauri/target/
+# Crate só de teste do modo gráfico (src-tauri/raster-tests, fora do build do app).
+src-tauri/raster-tests/target/
 
 # IDE
 .idea/

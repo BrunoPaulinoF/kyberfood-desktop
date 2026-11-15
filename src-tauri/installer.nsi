@@ -1,5 +1,5 @@
 ; ============================================================================
-; TEMPLATE DO INSTALADOR NSIS — CÓPIA do tauri-bundler, com TRÊS mudanças.
+; TEMPLATE DO INSTALADOR NSIS — CÓPIA do tauri-bundler, com QUATRO mudanças.
 ;
 ; Por que existe: o Tauri 1.x não tem opção de configuração para o atalho da
 ; área de trabalho (não há hook nem campo em `bundle.windows.nsis`), e o
@@ -9,7 +9,7 @@
 ; ORIGEM: tooling/bundler/src/bundle/windows/templates/installer.nsi da tag
 ; tauri-cli-v1.6.3 (a versão em package-lock.json), byte a byte igual ao 1.x.
 ;
-; AO ATUALIZAR O TAURI: recopie o template da tag nova e refaça as TRÊS mudanças
+; AO ATUALIZAR O TAURI: recopie o template da tag nova e refaça as QUATRO mudanças
 ; abaixo — elas estão marcadas com "[KYBERFOOD]" e são o que a trava
 ; src/lib/desktop-nsis-template.test.ts procura. Recopiar sem refazê-las volta a
 ; marcar o atalho, e nada acusa.
@@ -27,6 +27,11 @@
 ;   instalações na mesma máquina, e o atalho antigo abriria a versão velha para
 ;   sempre. O atalho que já existe é RENOMEADO (nunca apagado e recriado): quem
 ;   escolheu ter atalho continua com ele, quem não quis continua sem.
+; MUDANÇA 4 — o instalador de 64 bits RECUSA o computador em que o app não abre:
+;   Windows de 32 bits (antes ele instalava, e o atalho só mostrava "Este aplicativo
+;   não pode ser executado em seu PC") e Windows 7 ou mais antigo (o .exe pede
+;   funções do Windows 8+). Diz o porquê e oferece o download da versão Windows 7,
+;   que tem instalador próprio (ARCH x86, onde este bloco nem é compilado).
 ; ============================================================================
 
 Unicode true
@@ -44,6 +49,8 @@ Unicode true
 !include "StrFunc.nsh"
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
+; [KYBERFOOD] mudança 4: ${AtMostWin7} (recusa de PC antigo no .onInit).
+!include WinVer.nsh
 ${StrCase}
 ${StrLoc}
 
@@ -60,6 +67,9 @@ ${StrLoc}
 ; [KYBERFOOD] mudança 3: o nome que aparece embaixo do ícone. Fica separado do
 ; MAINBINARYNAME de propósito — o binário, a pasta e o registro não podem mudar.
 !define SHORTCUTNAME "KyberFood Impressora"
+; [KYBERFOOD] mudança 4: para onde o instalador de 64 bits manda o PC antigo. É a rota do
+; painel que entrega a versão Windows 7 (DESKTOP_WIN7_DOWNLOAD_PATH em src/lib/desktop-win7.ts).
+!define KYBERFOOD_WIN7_DOWNLOAD_URL "https://kyberfood.com.br/api/desktop/download?versao=win7"
 !define MAINBINARYSRCPATH "{{main_binary_path}}"
 !define BUNDLEID "{{bundle_id}}"
 !define COPYRIGHT "{{copyright}}"
@@ -435,6 +445,25 @@ Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   IfErrors +2 0
     StrCpy $PassiveMode 1
+
+  ; [KYBERFOOD] mudança 4: o instalador de 64 bits recusa Windows de 32 bits e Windows 7 (ou
+  ; mais antigo), onde o app não abre. Sem isto ele instalava normalmente e o problema só
+  ; aparecia no clique do atalho, sem dizer o que fazer.
+  !if "${ARCH}" == "x64"
+    ${IfNot} ${RunningX64}
+      Goto kyberfood_pc_antigo
+    ${EndIf}
+    ${If} ${AtMostWin7}
+      Goto kyberfood_pc_antigo
+    ${EndIf}
+    Goto kyberfood_pc_ok
+    kyberfood_pc_antigo:
+      MessageBox MB_YESNO|MB_ICONEXCLAMATION "Este computador tem Windows 7 (ou mais antigo) ou Windows de 32 bits, e esta versão do KyberFood Impressora não funciona nele.$\r$\n$\r$\nExiste uma versão própria para este computador: a versão para Windows 7.$\r$\n$\r$\nQuer abrir o download dela agora?" /SD IDNO IDNO kyberfood_pc_recusa
+      ExecShell "open" "${KYBERFOOD_WIN7_DOWNLOAD_URL}"
+    kyberfood_pc_recusa:
+      Abort
+    kyberfood_pc_ok:
+  !endif
 
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
     !insertmacro MUI_LANGDLL_DISPLAY

@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
 import { restoreDeviceStateIfEmpty } from './device-state'
+import { scrubPlaintextCopies, unlockSavedCredentials } from './credential-vault'
 
 // Rede de segurança contra tela branca: qualquer erro não tratado durante a
 // renderização passa a mostrar uma mensagem legível (com o erro real) em vez de
@@ -109,4 +110,19 @@ function mount() {
 //
 // O `finally` é a trava: a reserva NUNCA pode impedir o app de abrir. Se a leitura falhar,
 // o app sobe exatamente como sobe hoje.
-restoreDeviceStateIfEmpty().catch(() => {}).finally(mount)
+//
+// Depois da restauração, o cofre abre a credencial cifrada (e migra a que ainda estiver no
+// formato antigo) — também ANTES de montar, porque o App lê a credencial de forma síncrona.
+// Com TETO: se a cifra do Windows demorar, o app monta assim mesmo e a credencial entra
+// quando a leitura terminar (a sentinela da sessão confere de minuto em minuto).
+const VAULT_BOOT_TIMEOUT_MS = 5000
+
+async function boot() {
+  await restoreDeviceStateIfEmpty().catch(() => {})
+  const vault = unlockSavedCredentials().catch(() => {})
+  // A limpeza das cópias em arquivo roda depois e NÃO segura a montagem.
+  void vault.then(() => scrubPlaintextCopies()).catch(() => {})
+  await Promise.race([vault, new Promise<void>((resolve) => setTimeout(resolve, VAULT_BOOT_TIMEOUT_MS))])
+}
+
+boot().catch(() => {}).finally(mount)

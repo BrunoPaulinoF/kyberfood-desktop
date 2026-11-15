@@ -8,6 +8,35 @@ import {
   type ClockSkewNotice,
 } from './clock-skew';
 import { orderDisplayNumber } from './order-display';
+import {
+  buildStationTicketLayout,
+  normalizePrintStations,
+  splitItemsByStation,
+  stationOutageBlocks,
+  stationPrintTarget,
+  stationPrinterChoice,
+  stationProductIds,
+  type PrintStation,
+  type StationTicketDeps,
+  type StationTicketItem,
+} from './print-stations';
+import {
+  FISCAL_BLOCK_NOTICES,
+  FISCAL_PRINT_EXPIRED_ERROR,
+  FISCAL_PRINT_POLL_LIMIT,
+  FISCAL_PRINT_POLL_MS,
+  FISCAL_PRINT_VIA2_FAILED,
+  createFiscalRoundGate,
+  fiscalClockAnchor,
+  fiscalPrintPollDelayMs,
+  fiscalServerNowMs,
+  parseStoredFiscalOutcomes,
+  runFiscalQueueRound,
+  type FiscalPortResult,
+  type FiscalQueuePorts,
+  type FiscalServerClock,
+  type PendingFiscalOutcome,
+} from './fiscal-print';
 import { StatusPanel } from './components/StatusPanel';
 import { OrderCard } from './components/OrderCard';
 import { StatusBadge } from './components/StatusBadge';
@@ -37,6 +66,12 @@ import {
   LOGIN_PREFILL_STORAGE_KEY,
   writeDeviceStateFile,
 } from './device-state';
+import {
+  forgetSavedCredentials,
+  loadSavedCredentials,
+  saveSavedCredentials,
+  type SavedCredentials,
+} from './credential-vault';
 import { getVersion } from '@tauri-apps/api/app';
 import { open as openExternal } from '@tauri-apps/api/shell';
 import { checkUpdate, installUpdate } from '@tauri-apps/api/updater';
@@ -106,10 +141,24 @@ async function httpJson<T = any>(
   return { ok: res.ok, status: res.status, data: data as T | null };
 }
 
+// Versão para PC ANTIGO (Windows 7/8/8.1, 32 bits), gerada pelo workflow
+// `.github/workflows/desktop-build-win7.yml` com VITE_KYBERFOOD_WIN7=1. Ela tem canal de
+// atualização PRÓPRIO (Release `desktop-win7`, manifesto `latest-win7.json`): o manifesto do app
+// principal aponta para o instalador de 64 bits, que não abre nesse PC — oferecer ele seria
+// trocar um app que funciona por um que não abre. Os nomes espelham src/lib/desktop-win7.ts do
+// monorepo. Trava: src/lib/desktop-win7-build.test.ts.
+const IS_WIN7_BUILD = import.meta.env.VITE_KYBERFOOD_WIN7 === '1';
+const WIN7_RELEASE_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/download/desktop-win7';
+const APP_FLAVOR_LABEL = IS_WIN7_BUILD ? ' (Windows 7)' : '';
+
 // Manifesto publicado pelo GitHub Actions a cada build do app desktop.
 // O app o consulta para saber se há uma versão mais nova (atualização opcional).
-const UPDATE_MANIFEST_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/latest.json';
-const FALLBACK_DOWNLOAD_URL = 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/KyberFood-Setup.exe';
+const UPDATE_MANIFEST_URL = IS_WIN7_BUILD
+  ? `${WIN7_RELEASE_URL}/latest-win7.json`
+  : 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/latest.json';
+const FALLBACK_DOWNLOAD_URL = IS_WIN7_BUILD
+  ? `${WIN7_RELEASE_URL}/KyberFood-Setup-Win7.exe`
+  : 'https://github.com/BrunoPaulinoF/kyberfood-desktop/releases/latest/download/KyberFood-Setup.exe';
 
 type UpdateManifest = { version?: string; url_win?: string | null; notes?: string | null };
 
@@ -122,11 +171,14 @@ type UpdateManifest = { version?: string; url_win?: string | null; notes?: strin
  * atualizado", que foi exatamente o problema relatado.
  */
 async function fetchLatestManifest(): Promise<UpdateManifest | null> {
-  try {
-    const res = await httpJson<UpdateManifest>(`${apiUrl}/api/desktop/latest-version`);
-    if (res.ok && res.data?.version) return res.data;
-  } catch (err) {
-    console.warn('Versão publicada indisponível pelo servidor do KyberFood:', err);
+  // A versão Windows 7 pula o servidor: ele responde o manifesto do app PRINCIPAL (64 bits).
+  if (!IS_WIN7_BUILD) {
+    try {
+      const res = await httpJson<UpdateManifest>(`${apiUrl}/api/desktop/latest-version`);
+      if (res.ok && res.data?.version) return res.data;
+    } catch (err) {
+      console.warn('Versão publicada indisponível pelo servidor do KyberFood:', err);
+    }
   }
 
   const res = await httpJson<UpdateManifest>(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`);
@@ -153,6 +205,9 @@ async function fetchLatestManifest(): Promise<UpdateManifest | null> {
  * sobe hoje. Esta função é uma melhoria opcional, nunca um caminho crítico.
  */
 async function installUpdateOnLaunch(): Promise<boolean> {
+  // Versão Windows 7: o pacote do updater nativo é o de 64 bits. Atualiza só pelo botão,
+  // baixando o instalador Windows 7.
+  if (IS_WIN7_BUILD) return false;
   try {
     const { shouldUpdate } = await checkUpdate();
     if (!shouldUpdate) return false;
@@ -236,6 +291,12 @@ interface PrintConfig {
    * Só o `false` explícito desliga. ESPELHA `autoPrint` de src/lib/desktop-print-config.ts.
    */
   autoPrint: boolean;
+  /**
+   * IMPRESSORAS POR SETOR cadastradas no painel (ver ./print-stations.ts). VAZIO = a comanda
+   * de sempre, só na impressora do caixa: nenhuma linha nova de impressão roda.
+   * ESPELHA `stations` de src/lib/desktop-print-config.ts.
+   */
+  stations: PrintStation[];
 }
 
 const DEFAULT_PRINT_CONFIG: PrintConfig = {
@@ -253,6 +314,7 @@ const DEFAULT_PRINT_CONFIG: PrintConfig = {
   showOrderNotes: true,
   footerText: 'OBRIGADO E BOM APETITE!',
   autoPrint: true,
+  stations: [],
 };
 
 // Tamanho da fonte (em pt) enviado ao comando de impressão do Rust.
@@ -308,6 +370,7 @@ function normalizePrintConfig(value: any): PrintConfig {
     footerText: raw.footerText !== undefined ? String(raw.footerText) : DEFAULT_PRINT_CONFIG.footerText,
     // `!== false`: um `null` no jsonb não pode parar a comanda de ninguém.
     autoPrint: raw.autoPrint !== false,
+    stations: normalizePrintStations(raw.stations),
   };
 }
 
@@ -335,6 +398,32 @@ function loadPanelAutoPrint(storeId: string): boolean {
 function savePanelAutoPrint(storeId: string, enabled: boolean) {
   try {
     localStorage.setItem(`${PANEL_AUTO_PRINT_STORAGE_KEY}.${storeId}`, enabled ? 'on' : 'off');
+  } catch {
+    /* sem disco vale a resposta do heartbeat, que chega a cada 30s */
+  }
+}
+
+/**
+ * IMPRESSORAS POR SETOR guardadas em DISCO, pelo mesmo motivo da chave acima: o cadastro vem
+ * no heartbeat, e ao abrir o app (depois de uma queda de energia, com pedidos na fila) as
+ * comandas pendentes sairiam ANTES de ele responder — só no caixa, sem a via da pizza.
+ * Guardado, o app abre já sabendo. Disco ilegível = sem setores, que é a comanda de sempre.
+ */
+const PANEL_STATIONS_STORAGE_KEY = 'kyberfood.desktop.printStations';
+
+function loadPanelStations(storeId: string): PrintStation[] {
+  try {
+    return normalizePrintStations(JSON.parse(localStorage.getItem(`${PANEL_STATIONS_STORAGE_KEY}.${storeId}`) || '[]'));
+  } catch {
+    return [];
+  }
+}
+
+function savePanelStations(storeId: string, stations: PrintStation[]) {
+  try {
+    const key = `${PANEL_STATIONS_STORAGE_KEY}.${storeId}`;
+    if (stations.length === 0) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify(stations));
   } catch {
     /* sem disco vale a resposta do heartbeat, que chega a cada 30s */
   }
@@ -513,6 +602,18 @@ const CHANGE_RECEIPT_LABEL = '*** LEVAR DE TROCO:';
 // Formas offline (dinheiro, cartão na entrega) não passam por aqui: imprimem na
 // hora, como sempre.
 function isAwaitingOnlinePixPayment(order: Order): boolean {
+  // PIX (CHAVE) ESPERANDO O COMPROVANTE — ESPELHA `orderAwaitsPixKeyProof`
+  // (src/lib/pix-key-proof.ts do web): a loja só confirma depois do comprovante,
+  // então o pedido segurado não toca nem imprime, como o PIX online não pago.
+  const proof = (order.metadata as any)?.pix_key_proof;
+  if (
+    (order.payment_method || '').toLowerCase() === 'pix_key' &&
+    proof?.required === true &&
+    proof?.status !== 'accepted' &&
+    order.status !== 'cancelled'
+  ) {
+    return true;
+  }
   const payments = order.metadata?.saipos?.payment_types;
   const requiresOnlinePix =
     (order.payment_method || '').toLowerCase() === 'pix' ||
@@ -550,6 +651,9 @@ function formatOrderDateTime(value: string, timezone?: string | null): string {
 
 export interface OrderItem {
   id: string;
+  // Produto do cardápio (nulo no iFood/Goomer): é por ele que se acha a CATEGORIA do item,
+  // e a categoria diz em qual impressora de setor ele sai. Ver ./print-stations.ts.
+  product_id?: string | null;
   product_name: string;
   quantity: number;
   unit_price: number;
@@ -576,6 +680,21 @@ export interface Settings {
   soundEnabled: boolean;
   selectedPrinter: string;
   volume: number;
+  /**
+   * "Imprimir cupom fiscal neste computador". POR COMPUTADOR, como a impressora. NASCE SEM
+   * ESCOLHA (ausente): com dois PCs na loja o cupom sairia no primeiro que pegasse, não
+   * necessariamente no do caixa. Só o `true` explícito imprime; enquanto o lojista não escolhe,
+   * o app avisa "Escolha se este computador imprime o cupom fiscal" e o painel cobre pelo plano B.
+   */
+  fiscalPrintHere?: boolean;
+  /**
+   * IMPRESSORAS POR SETOR: qual impressora do Windows DESTE computador é cada cadastro do
+   * painel (`id do cadastro → nome da impressora`). POR COMPUTADOR, como `selectedPrinter`
+   * (que é a do CAIXA e continua obrigatória). Cadastro AUSENTE daqui = ninguém escolheu
+   * ainda (o app avisa e não imprime a via); `''` = "não imprimir neste computador". Nos dois
+   * casos nada se perde: os itens continuam na comanda completa do caixa.
+   */
+  stationPrinters?: Record<string, string>;
 }
 
 
@@ -621,6 +740,32 @@ const RECEIPT_QUEUE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /** Por quanto tempo a lista gravada em disco é mantida — depois disso nada mais imprime mesmo. */
 const PRINTED_ORDERS_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * DESFECHOS PENDENTES DO CUPOM FISCAL, em DISCO e por loja (o mesmo mecanismo da lista de
+ * comandas impressas): o papel já saiu (ou já falhou) e o banco ainda não soube. Sobrevivem a
+ * reinício e são regravados a cada volta da fila — nunca reimpressos. Disco ilegível = lista
+ * vazia (o painel cobre o job preso pelo prazo de `claimed_at`).
+ */
+const FISCAL_OUTCOMES_STORAGE_KEY = 'kyberfood.desktop.fiscalOutcomes';
+
+function loadFiscalOutcomes(storeId: string): PendingFiscalOutcome[] {
+  try {
+    return parseStoredFiscalOutcomes(localStorage.getItem(`${FISCAL_OUTCOMES_STORAGE_KEY}.${storeId}`));
+  } catch {
+    return [];
+  }
+}
+
+function saveFiscalOutcomes(storeId: string, outcomes: PendingFiscalOutcome[]) {
+  try {
+    const key = `${FISCAL_OUTCOMES_STORAGE_KEY}.${storeId}`;
+    if (outcomes.length === 0) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify(outcomes));
+  } catch {
+    // Sem disco o desfecho fica só nesta volta: o painel cobre pelo prazo de `claimed_at`.
+  }
+}
 
 function printedOrdersKey(storeId: string): string {
   // Por LOJA: o app pode ser reapontado para outra loja, e a lista de uma não diz nada
@@ -856,6 +1001,52 @@ function notifyStaleReceipt(order: Order) {
 }
 
 /**
+ * IMPRESSORAS POR SETOR — o que este computador já fez de cada pedido (ver ./print-stations.ts).
+ *
+ * Existe para a RETENTATIVA não repetir papel: o pedido só conta como impresso quando a
+ * comanda do caixa E as vias dos setores saíram, e o polling volta a cada 10s enquanto falta
+ * alguma. Sem esta memória, a volta seguinte mandaria a comanda do caixa de novo (o contador
+ * de vias dela é apagado quando ela termina) e repetiria a via da pizza que já saiu.
+ *
+ * Vive em memória, como `printedViasRef`: fechar o app no meio reimprime o pedido inteiro ao
+ * voltar — papel repetido, nunca papel faltando.
+ */
+interface StationPrintState {
+  /** Pedidos cuja comanda do CAIXA já saiu inteira (todas as vias). */
+  cashierDone: Set<string>;
+  /** Pedido → cadastros cuja via já saiu. */
+  done: Map<string, Set<string>>;
+  /**
+   * Impressora do Windows → desde quando ela vem falhando (apagado no 1º sucesso). É por
+   * IMPRESSORA, não por pedido: com a impressora da cozinha fora, só o primeiro pedido espera
+   * o prazo; os seguintes tentam uma vez e já saem no caixa.
+   */
+  printerFailingSince: Map<string, number>;
+  /** Pedido → itens separados por setor (lidos uma vez; a retentativa não consulta de novo). */
+  groups: Map<string, Array<{ station: PrintStation; items: OrderItem[] }>>;
+  /** Pedido → quando a leitura das categorias falhou pela 1ª vez. */
+  lookupFailingSince: Map<string, number>;
+}
+
+function newStationPrintState(): StationPrintState {
+  return {
+    cashierDone: new Set(),
+    done: new Map(),
+    printerFailingSince: new Map(),
+    groups: new Map(),
+    lookupFailingSince: new Map(),
+  };
+}
+
+/** O pedido terminou (tudo saiu): a memória dele não serve mais e cresceria sem fim. */
+function forgetStationPrints(state: StationPrintState, orderId: string) {
+  state.cashierDone.delete(orderId);
+  state.done.delete(orderId);
+  state.groups.delete(orderId);
+  state.lookupFailingSince.delete(orderId);
+}
+
+/**
  * Avisa o balcão de que uma comanda NÃO saiu.
  *
  * O app passa a vida escondido na bandeja, então `setPrintError` (texto na tela) não é
@@ -987,10 +1178,10 @@ const AUTH_STORAGE_KEY = 'kyberfood.desktop.auth';
  * digitar" — isso é a loja muda, sem IA e sem comanda, até alguém reparar. Só o botão Sair
  * desconecta de verdade, e é ele que apaga o que está aqui.
  *
- * Sobre guardar a senha: fica no mesmo localStorage onde o Supabase JÁ guarda o refresh
- * token — que, sozinho, também dá acesso total à conta. Ou seja, a proteção real (aqui e
- * lá) é a pasta de perfil do usuário do Windows. O base64 não é criptografia, é só para o
- * arquivo não expor a senha a olho nu.
+ * Sobre guardar a senha: ela vai para o disco CIFRADA pela DPAPI do Windows (a chave fica
+ * com o Windows, por usuário) — ver `credential-vault.ts`, que também migra sozinho o
+ * formato antigo (base64) sem nunca deixar a loja sem credencial. A senha em claro só existe
+ * na memória do app.
  */
 
 /**
@@ -1050,34 +1241,22 @@ function reloginBackoffMs(streak: number): number {
   return Math.min(RELOGIN_MAX_INTERVAL_MS, RELOGIN_MIN_INTERVAL_MS * 2 ** (streak - 1));
 }
 
-type SavedCredentials = { email: string; password: string };
-
 function saveCredentials(credentials: SavedCredentials) {
   try {
-    const json = JSON.stringify(credentials);
-    localStorage.setItem(CREDENTIALS_STORAGE_KEY, btoa(String.fromCharCode(...new TextEncoder().encode(json))));
-    // Espelha na reserva: é o que mantém a loja conectada depois de uma atualização.
-    void writeDeviceStateFile();
+    // O cofre cifra, confere e grava (e espelha na reserva); a credencial já vale na hora.
+    saveSavedCredentials(CREDENTIALS_STORAGE_KEY, credentials);
   } catch {
     /* sem storage o relogin automático não existe, mas o login normal continua */
   }
 }
 
 function loadCredentials(): SavedCredentials | null {
-  try {
-    const raw = localStorage.getItem(CREDENTIALS_STORAGE_KEY);
-    if (!raw) return null;
-    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-    const parsed = JSON.parse(new TextDecoder().decode(bytes));
-    if (typeof parsed?.email === 'string' && typeof parsed?.password === 'string') return parsed;
-    return null;
-  } catch {
-    return null;
-  }
+  return loadSavedCredentials(CREDENTIALS_STORAGE_KEY);
 }
 
 function clearCredentials() {
   try {
+    forgetSavedCredentials(CREDENTIALS_STORAGE_KEY);
     localStorage.removeItem(CREDENTIALS_STORAGE_KEY);
     // A reserva TAMBÉM some: sem isto o botão Sair não desconectaria de verdade — a
     // restauração devolveria a credencial apagada no próximo arranque.
@@ -1095,33 +1274,19 @@ function clearCredentials() {
  * não dispara nada: ela só deixa o e-mail e a senha já digitados, para quem clicou em
  * Sair (ou teve a sessão recusada) voltar clicando UMA vez em Entrar.
  *
- * Guardá-la não é exposição nova: é o mesmo conteúdo que a outra chave já guarda, no
- * mesmo lugar (a pasta de perfil do usuário do Windows).
+ * Guardá-la não é exposição nova: é o mesmo conteúdo que a outra chave já guarda, com a
+ * mesma cifra (`credential-vault.ts`).
  */
 function saveLoginPrefill(credentials: SavedCredentials) {
   try {
-    const json = JSON.stringify(credentials);
-    localStorage.setItem(
-      LOGIN_PREFILL_STORAGE_KEY,
-      btoa(String.fromCharCode(...new TextEncoder().encode(json))),
-    );
-    void writeDeviceStateFile();
+    saveSavedCredentials(LOGIN_PREFILL_STORAGE_KEY, credentials);
   } catch {
     /* sem storage a tela só abre vazia, como antes */
   }
 }
 
 function loadLoginPrefill(): SavedCredentials | null {
-  try {
-    const raw = localStorage.getItem(LOGIN_PREFILL_STORAGE_KEY);
-    if (!raw) return null;
-    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-    const parsed = JSON.parse(new TextDecoder().decode(bytes));
-    if (typeof parsed?.email === 'string' && typeof parsed?.password === 'string') return parsed;
-    return null;
-  } catch {
-    return null;
-  }
+  return loadSavedCredentials(LOGIN_PREFILL_STORAGE_KEY);
 }
 
 /**
@@ -1285,6 +1450,14 @@ function App() {
   // 'enforce' fechar/sair daqui derruba a IA — dizer isso na loja em 'off' seria um susto
   // falso, então a confirmação de saída só cita a IA quando é verdade.
   const [aiGateMode, setAiGateMode] = useState<string | null>(null);
+  // A nota fiscal está ligada NESTA loja? Vem do heartbeat (`fiscalPrintEnabled`, calculado no
+  // servidor). Começa e fica `false` sem a resposta: sem ela o app não consulta a fila do cupom
+  // nem mostra a opção nas Configurações.
+  const [fiscalPrintEnabled, setFiscalPrintEnabled] = useState(false);
+  const fiscalPrintEnabledRef = useRef(false);
+  // Bloqueio do cupom fiscal que só aparece num job (bobina menor, impressora sumida): UM aviso
+  // fixo na tela, sem notificação a cada volta.
+  const [fiscalNotice, setFiscalNotice] = useState<string | null>(null);
   // Alguém tentou abrir o app pela SEGUNDA vez: esta janela foi trazida para a frente e o
   // aviso explica por quê (ver SINGLE_INSTANCE_EVENT).
   const [alreadyOpenNotice, setAlreadyOpenNotice] = useState(false);
@@ -1353,6 +1526,9 @@ function App() {
   const printedViasRef = useRef<Map<string, number>>(new Map());
   // De qual loja é o contador acima: ele só é zerado quando a loja MUDA (ver o efeito do polling).
   const printedViasStoreIdRef = useRef<string>('');
+  // IMPRESSORAS POR SETOR: o que já saiu de cada pedido (ver `StationPrintState`). Zerado
+  // junto com o contador de vias, pelas mesmas razões.
+  const stationPrintStateRef = useRef<StationPrintState>(newStationPrintState());
   // Linha de base: na 1ª sincronização após o login NÃO alertamos os pedidos que
   // já existiam. Ela vale só para o SOM/notificação — a impressão é decidida pela fila
   // gravada em disco, senão a comanda pendente de uma queda de energia nasceria "já
@@ -1392,16 +1568,22 @@ function App() {
   // vencimento do token com o relógio LOCAL, então com a data/hora errada o app desloga e
   // fica reconectando sem dizer por quê. Este aviso diz a causa e como corrigir.
   const [clockNotice, setClockNotice] = useState<ClockSkewNotice | null>(null);
+  // Âncora da hora do SERVIDOR para a fila do cupom fiscal: a hora medida aqui + o
+  // `performance.now()` do mesmo instante (`fiscalClockAnchor`). A idade do job é contada por
+  // ela e pelo relógio monotônico, nunca pelo relógio cru do PC; `null` sem medida confiável.
+  const fiscalClockRef = useRef<FiscalServerClock | null>(null);
   const checkClock = useCallback(async () => {
     try {
       const sentAtMs = Date.now();
       const res = await httpJson<{ now?: unknown }>(`${apiUrl}/api/time`, { timeoutSeconds: 10 });
       const receivedAtMs = Date.now();
+      const receivedPerfMs = performance.now();
       if (!res.ok) return;
       const skew = measureClockSkew({ sentAtMs, receivedAtMs, serverNowMs: res.data?.now });
       // Medida não confiável (rede lenta, resposta estranha) não muda nada: sem certeza,
       // nada é afirmado — nem o aviso aparece, nem um aviso verdadeiro some.
       if (skew === null) return;
+      fiscalClockRef.current = fiscalClockAnchor(receivedAtMs, skew, receivedPerfMs);
       setClockNotice(describeClockSkew(skew, Date.now(), 'app'));
     } catch {
       // Sem internet não há como conferir; o aviso de conexão já cobre esse caso.
@@ -1541,9 +1723,9 @@ function App() {
 
     // Com o updater nativo ligado, o botão INSTALA e reinicia — o lojista não precisa
     // baixar nem passar pelo instalador do Windows. Aqui reiniciar é seguro: foi ele quem
-    // pediu, na hora que escolheu.
+    // pediu, na hora que escolheu. (Versão Windows 7: nunca — o pacote nativo é o de 64 bits.)
     try {
-      const { shouldUpdate } = await checkUpdate();
+      const { shouldUpdate } = IS_WIN7_BUILD ? { shouldUpdate: false } : await checkUpdate();
       if (shouldUpdate) {
         setUpdateCheck({ state: 'installing' });
         await writeDeviceStateFile();
@@ -1613,6 +1795,8 @@ function App() {
           // só em 'enforce' fechar o app derruba a IA, e é isso que decide se a
           // confirmação de saída pode dizer que a atendente vai parar.
           ai_gate?: { ai_serving?: boolean; mode?: string };
+          // A nota ligada na loja (servidor): só o `true` liga a fila do cupom fiscal.
+          fiscalPrintEnabled?: boolean;
         }>(
           `${apiUrl}/api/desktop/heartbeat?storeId=${store.id}`,
           {
@@ -1638,9 +1822,12 @@ function App() {
           panelAutoPrintRef.current = config.autoPrint;
           setPanelAutoPrint(config.autoPrint);
           savePanelAutoPrint(store.id, config.autoPrint);
+          savePanelStations(store.id, config.stations);
         }
         setAiServing(data?.ai_gate?.ai_serving !== false);
         setAiGateMode(typeof data?.ai_gate?.mode === 'string' ? data.ai_gate.mode : null);
+        fiscalPrintEnabledRef.current = data?.fiscalPrintEnabled === true;
+        setFiscalPrintEnabled(fiscalPrintEnabledRef.current);
         setHeartbeatFailing(false);
       } catch (err) {
         console.warn('Falha no heartbeat do desktop:', err);
@@ -1901,11 +2088,20 @@ function App() {
     const panelAutoPrintSaved = loadPanelAutoPrint(store.id);
     panelAutoPrintRef.current = panelAutoPrintSaved;
     setPanelAutoPrint(panelAutoPrintSaved);
+    // IMPRESSORAS POR SETOR desta loja, também ANTES da primeira busca (ver loadPanelStations).
+    // O ref é escrito na hora: o efeito que o atualiza só roda depois do render, e o primeiro
+    // pedido da fila já teria saído sem as vias dos setores.
+    const stationsSaved = loadPanelStations(store.id);
+    if (!sameJson(printConfigRef.current.stations, stationsSaved)) {
+      printConfigRef.current = { ...printConfigRef.current, stations: stationsSaved };
+      setPrintConfig((prev) => ({ ...prev, stations: stationsSaved }));
+    }
     // O contador de vias só recomeça quando a LOJA muda. Rodar este efeito de novo para a
     // mesma loja (sessão renovada, relogin) não pode esquecer que a 1ª via já saiu: a
     // retentativa da 2ª mandaria a comanda inteira de novo para a cozinha.
     if (printedViasStoreIdRef.current !== store.id) {
       printedViasRef.current = new Map();
+      stationPrintStateRef.current = newStationPrintState();
       printedViasStoreIdRef.current = store.id;
     }
     baselineDoneRef.current = false;
@@ -2209,6 +2405,186 @@ function App() {
     };
   }, [isAuthenticated, store, runPrintJob]);
 
+  // ===========================================================================
+  // CUPOM FISCAL (fiscal_print_jobs) — DANFE NFC-e, plano PDV enxuto 5.8
+  //
+  // Fila PRÓPRIA, separada da comanda e da fila do painel: o app antigo nem a conhece (nunca
+  // imprime cupom sem QR), e esta versão a lê por POLLING — a tabela fica fora do realtime.
+  // Mesmo cliente e mesma sessão (o dono) da `desktop_print_jobs`; o banco dá ao dono só SELECT e
+  // UPDATE das colunas de estado (sem INSERT/DELETE: o job é do servidor).
+  //
+  // A MÁQUINA DE ESTADOS é `runFiscalQueueRound` (pura, em `fiscal-print.ts`, testada no
+  // monorepo com portas falsas). Aqui só se ligam as PORTAS ao Supabase e ao Rust, e o laço:
+  //  - a fila só é LIDA com a nota ligada NA LOJA (`fiscalPrintEnabled`, heartbeat) e o cupom
+  //    ligado NESTE PC; loja sem nota não ganha consulta nenhuma;
+  //  - o laço roda mesmo assim para regravar desfechos pendentes guardados em DISCO (papel que
+  //    saiu e o banco não soube), inclusive com a opção do PC desligada;
+  //  - idade do job pela hora do SERVIDOR (âncora de `checkClock` + `performance.now()`).
+  //
+  // Nada aqui toca a comanda (`printOrder`, os renderizadores, a fila do painel).
+  // ===========================================================================
+  const fiscalJobSeenRef = useRef<Set<string>>(new Set());
+  const fiscalRoundGateRef = useRef(createFiscalRoundGate());
+  // Bloqueios que dá para saber sem job: o PC ainda não escolheu, ou escolheu e não tem impressora.
+  const fiscalPrintChoiceMissing = settings.fiscalPrintHere === undefined;
+  const fiscalPrinterMissing = settings.fiscalPrintHere === true && !settings.selectedPrinter;
+  // IMPRESSORAS POR SETOR sem escolha NESTE computador: o painel cadastrou, mas aqui ninguém
+  // disse qual impressora é (nem "não imprimir neste computador"). A via não sai — os itens
+  // continuam na comanda do caixa — e o aviso fica fixo até alguém escolher.
+  const stationsWithoutChoice = printConfig.stations.filter(
+    (station) => stationPrinterChoice(settings.stationPrinters, station.id).state === 'unset',
+  );
+
+  useEffect(() => {
+    // Fora do app (Vite aberto no navegador) não há raster nem spooler.
+    if (!isTauri || !isAuthenticated || !store) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let failures = 0;
+    const storeId = store.id;
+    const deviceId = getDeviceId();
+
+    // 401 = sessão vencida (o relogin resolve); qualquer outro erro = tenta na próxima volta.
+    const result = <T,>(value: T, error: unknown, status: number): FiscalPortResult<T> =>
+      status === 401 ? { ok: false, unauthorized: true } : error ? { ok: false } : { ok: true, value };
+
+    const ports: FiscalQueuePorts = {
+      list: async (sinceIso) => {
+        try {
+          const { data, error, status } = await supabase
+            .from('fiscal_print_jobs')
+            .select('id, status, created_at, content')
+            .eq('store_id', storeId)
+            .eq('status', 'pending')
+            .gte('created_at', sinceIso)
+            .order('created_at', { ascending: true })
+            .limit(FISCAL_PRINT_POLL_LIMIT);
+          return result(Array.isArray(data) ? data : [], error, status);
+        } catch {
+          return { ok: false };
+        }
+      },
+      claim: async (jobId, claimedAt) => {
+        try {
+          const { data, error, status } = await supabase
+            .from('fiscal_print_jobs')
+            .update({ status: 'printing', claimed_at: claimedAt, device_id: deviceId })
+            .eq('id', jobId)
+            .eq('status', 'pending')
+            .select('id');
+          return result(Array.isArray(data) ? data.length > 0 : Boolean(data), error, status);
+        } catch {
+          return { ok: false };
+        }
+      },
+      readOwn: async (jobId) => {
+        try {
+          const { data, error, status } = await supabase
+            .from('fiscal_print_jobs')
+            .select('status')
+            .eq('id', jobId)
+            .eq('device_id', deviceId)
+            .maybeSingle();
+          return result(typeof data?.status === 'string' ? data.status : null, error, status);
+        } catch {
+          return { ok: false };
+        }
+      },
+      expire: async (jobId, finishedAt) => {
+        try {
+          const { error, status } = await supabase
+            .from('fiscal_print_jobs')
+            .update({ status: 'failed', error: FISCAL_PRINT_EXPIRED_ERROR, device_id: deviceId, finished_at: finishedAt })
+            .eq('id', jobId)
+            .eq('status', 'pending');
+          return result(undefined, error, status);
+        } catch {
+          return { ok: false };
+        }
+      },
+      finish: async ({ jobId, status: outcome, error: reason, finishedAt }) => {
+        try {
+          const { error, status } = await supabase
+            .from('fiscal_print_jobs')
+            .update({ status: outcome, error: reason, finished_at: finishedAt })
+            .eq('id', jobId)
+            .eq('status', 'printing')
+            .eq('device_id', deviceId);
+          return result(undefined, error, status);
+        } catch {
+          return { ok: false };
+        }
+      },
+      printVia: async (printerName, layout, width) => {
+        await invoke('print_fiscal_receipt', { printerName, layout, width });
+      },
+    };
+
+    const round = async () => {
+      if (disposed) return;
+      // UMA volta por vez, mesmo com o efeito reiniciado (troca de loja) e a volta anterior
+      // ainda imprimindo: duas voltas juntas poderiam disputar o mesmo job e o mesmo disco.
+      const gate = fiscalRoundGateRef.current;
+      if (!gate.tryEnter()) {
+        timer = setTimeout(() => { void round(); }, 1_000);
+        return;
+      }
+      let ok = false;
+      let nextDelay: number | null = null;
+      try {
+        const polling = fiscalPrintEnabledRef.current && settingsRef.current.fiscalPrintHere === true;
+        const outcomes = loadFiscalOutcomes(storeId);
+        // Nada a ler nem a regravar: nenhuma consulta (é o estado de toda loja sem nota).
+        if (!polling && outcomes.length === 0) {
+          nextDelay = FISCAL_PRINT_POLL_MS;
+          return;
+        }
+        const done = await runFiscalQueueRound(
+          {
+            serverNow: () => fiscalServerNowMs(fiscalClockRef.current, performance.now()),
+            polling,
+            pc: {
+              printerName: settingsRef.current.selectedPrinter,
+              paperWidth: printConfigRef.current.paperWidth,
+              fiscalPrintHere: settingsRef.current.fiscalPrintHere,
+            },
+            outcomes,
+            seen: fiscalJobSeenRef.current,
+            persist: (pending) => saveFiscalOutcomes(storeId, pending),
+          },
+          ports,
+        );
+        if (done.unauthorized) void reloginRef.current();
+        if (done.needsClock) void checkClock();
+        for (const job of done.jobs) {
+          // Bloqueio que o lojista precisa resolver vira UM aviso fixo (sem notificação a cada
+          // volta); o primeiro cupom impresso o apaga.
+          if (job.kind === 'skipped' && (job.block === 'no_printer' || job.block === 'paper')) {
+            setFiscalNotice(FISCAL_BLOCK_NOTICES[job.block]);
+          }
+          if (job.kind === 'done' && job.outcome.status === 'printed' && !job.outcome.error) setFiscalNotice(null);
+          // Sem `setPrintError(null)` no sucesso: o cupom não pode apagar o aviso de uma COMANDA.
+          if (job.kind === 'done' && (job.outcome.status === 'failed' || job.outcome.error === FISCAL_PRINT_VIA2_FAILED)) {
+            setPrintError(`O cupom fiscal não saiu inteiro na impressora "${settingsRef.current.selectedPrinter}" — verifique a impressora`);
+          }
+        }
+        ok = done.ok;
+      } catch (err) {
+        console.warn('Falha na fila do cupom fiscal:', err);
+      } finally {
+        gate.leave();
+        failures = nextDelay !== null || ok ? 0 : failures + 1;
+        if (!disposed) timer = setTimeout(() => { void round(); }, nextDelay ?? fiscalPrintPollDelayMs(failures));
+      }
+    };
+    void round();
+
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [isAuthenticated, store, checkClock]);
+
   // Request notification permission
   useEffect(() => {
     if (window.Notification && Notification.permission === 'default') {
@@ -2259,6 +2635,13 @@ function App() {
     const totalVias = reimpressao ? Math.max(1, options!.copies!) : normalizePrintCopies(printConfigRef.current.copies);
     // De onde continuar: a via que falhou na tentativa anterior, nunca a comanda inteira.
     const jaSairam = reimpressao ? 0 : (printedViasRef.current.get(order.id) || 0);
+    // IMPRESSORAS POR SETOR: a comanda do CAIXA deste pedido já saiu inteira numa volta
+    // anterior e o que falta é a via de algum setor. Vai direto a elas — repetir o caminho
+    // abaixo mandaria a comanda do caixa de novo. Só entra aqui o pedido que ficou pendente
+    // por causa de um setor; loja sem impressoras cadastradas nunca tem esta marca.
+    if (!reimpressao && stationPrintStateRef.current.cashierDone.has(order.id)) {
+      return printStationTickets(order, printerName);
+    }
     if (jaSairam >= totalVias) return true;
 
     try {
@@ -2318,7 +2701,9 @@ function App() {
       if (!reimpressao) printedViasRef.current.delete(order.id);
       if (!silencioso) setPrintError(null);
       console.log('Order printed successfully');
-      return true;
+      // A COMANDA DO CAIXA SAIU. Para reimpressão/teste (uma folha na mão de quem clicou) e
+      // para a loja SEM impressoras por setor — todas as de hoje — acaba aqui, como sempre.
+      if (reimpressao || printConfigRef.current.stations.length === 0) return true;
     } catch (err) {
       console.error('Error printing order:', err);
       avisaFalha(
@@ -2351,6 +2736,167 @@ function App() {
       // NÃO é sucesso: com a janela escondida na bandeja o window.print() acima não
       // imprime nada que alguém veja. O pedido volta à fila para o polling retentar.
       return false;
+    }
+
+    // IMPRESSORAS POR SETOR, DEPOIS e FORA do `try` da comanda do caixa: uma falha na
+    // impressora da pizza não pode cair no plano B do caixa (janela do navegador, aviso de
+    // "impressora do caixa não respondeu"). A marca abaixo é o que impede a retentativa de
+    // reimprimir a comanda do caixa enquanto a via de um setor ainda não saiu.
+    stationPrintStateRef.current.cashierDone.add(order.id);
+    return printStationTickets(order, printerName);
+  };
+
+  /**
+   * Manda um documento (blocos) a UMA impressora, no modo que o lojista configurou — o mesmo
+   * par texto/gráfico da comanda do caixa, pelos mesmos comandos do Rust. Rejeita se o
+   * spooler recusar.
+   */
+  const sendLayoutToPrinter = async (printerName: string, blocks: ReceiptBlock[], cfg: PrintConfig) => {
+    const content = encodeReceiptText(layoutToLines(blocks, cfg.paperWidth)) + '\n\n\n';
+    if (cfg.fontStyle === 'graphic') {
+      await invoke('print_receipt_graphic', {
+        printerName,
+        layout: encodeReceiptLayout(blocks),
+        fallbackContent: content,
+        width: cfg.paperWidth,
+        fontSize: FONT_SIZE_PT[cfg.fontSize],
+      });
+      return;
+    }
+    await invoke('print_receipt', {
+      printerName,
+      content,
+      width: cfg.paperWidth,
+      fontSize: FONT_SIZE_PT[cfg.fontSize],
+    });
+  };
+
+  /**
+   * AS VIAS DOS SETORES de um pedido cuja comanda do caixa JÁ SAIU (ver ./print-stations.ts).
+   *
+   * Devolve `true` quando não falta nada — e é `true` de saída para tudo o que não é desta
+   * função: loja sem cadastro, computador que não ligou nenhum cadastro a uma impressora,
+   * pedido sem item de setor (iFood, Goomer). `false` = falta via; o polling volta em 10s e
+   * tenta SÓ o que falta.
+   *
+   * NUNCA REJEITA: quem chama é o caminho da comanda, e um erro daqui não pode virar "a
+   * comanda do caixa falhou".
+   *
+   * O PLANO B É O CAIXA: impressora do setor falhando há `STATION_FALLBACK_AFTER_MS` → a via
+   * sai na impressora do caixa com o aviso no topo. A impressora do setor é SEMPRE tentada
+   * primeiro (é assim que o app percebe que ela voltou), e o caixa só entra depois da recusa.
+   */
+  const printStationTickets = async (order: Order, cashierPrinter: string): Promise<boolean> => {
+    const state = stationPrintStateRef.current;
+    const finish = () => {
+      forgetStationPrints(state, order.id);
+      return true;
+    };
+    try {
+      if (!store) return finish();
+      const cfg = printConfigRef.current;
+      // Só os cadastros que ESTE computador ligou a uma impressora do Windows. "Sem escolha"
+      // e "não imprimir aqui" não imprimem via — os itens estão na comanda do caixa.
+      const targets: Array<{ station: PrintStation; printerName: string }> = [];
+      for (const station of cfg.stations) {
+        const choice = stationPrinterChoice(settingsRef.current.stationPrinters, station.id);
+        if (choice.state === 'printer') targets.push({ station, printerName: choice.printerName });
+      }
+      if (targets.length === 0) return finish();
+
+      // OS ITENS DE CADA SETOR. A categoria não vem no item do pedido: é lida do produto,
+      // UMA vez por pedido (a retentativa reaproveita). Só para quem tem impressora "só os
+      // itens dela" ligada neste computador.
+      let groups = state.groups.get(order.id);
+      if (!groups && targets.some((t) => !t.station.fullReceipt)) {
+        const productIds = stationProductIds(order.items);
+        if (productIds.length === 0) {
+          groups = [];
+        } else {
+          try {
+            const { data, error } = await supabase
+              .from('products')
+              .select('id, category_id')
+              .in('id', productIds)
+              .eq('store_id', store.id);
+            if (error) throw error;
+            const categoryByProduct = new Map<string, string | null>();
+            for (const row of (data as Array<{ id: string; category_id: string | null }> | null) || []) {
+              categoryByProduct.set(row.id, row.category_id);
+            }
+            groups = splitItemsByStation(order.items, (id) => categoryByProduct.get(id), cfg.stations);
+          } catch (err) {
+            // LEITURA QUE FALHOU NÃO É "PEDIDO SEM ITEM DE SETOR": tenta de novo nas próximas
+            // voltas. Passado o prazo, desiste com AVISO — a comanda completa já está no
+            // caixa, e segurar o pedido para sempre só o faria sair repetido ao reabrir o app.
+            console.warn('Nao consegui ler as categorias para separar o pedido por setor:', err);
+            const since = state.lookupFailingSince.get(order.id) ?? Date.now();
+            state.lookupFailingSince.set(order.id, since);
+            if (stationPrintTarget(since, Date.now()) === 'station') {
+              setPrintError(`Não consegui separar o pedido ${orderDisplayNumber(order)} por setor — tentando de novo`);
+              return false;
+            }
+            setPrintError(`O pedido ${orderDisplayNumber(order)} NÃO saiu separado por setor — use a comanda completa do caixa`);
+            notifyPrintFailure(order, 'Não consegui separar o pedido por setor. Use a comanda completa do caixa');
+            groups = [];
+          }
+        }
+        state.groups.set(order.id, groups);
+      }
+
+      const done = state.done.get(order.id) ?? new Set<string>();
+      state.done.set(order.id, done);
+      let allOk = true;
+      let wentToCashier = false;
+      for (const { station, printerName } of targets) {
+        if (done.has(station.id)) continue;
+        let items: OrderItem[] = [];
+        if (!station.fullReceipt) {
+          items = groups?.find((group) => group.station.id === station.id)?.items ?? [];
+          // Nada deste setor no pedido: não há via a imprimir.
+          if (items.length === 0) continue;
+        }
+        const ticket = (outage: boolean) => (station.fullReceipt
+          ? buildFullStationLayout(order, store, cfg, station, outage)
+          : buildOrderStationLayout(order, store, station, items, outage));
+        try {
+          await sendLayoutToPrinter(printerName, ticket(false), cfg);
+          done.add(station.id);
+          state.printerFailingSince.delete(printerName);
+          continue;
+        } catch (err) {
+          console.error(`Erro ao imprimir a via de ${station.name}:`, err);
+        }
+        const since = state.printerFailingSince.get(printerName) ?? Date.now();
+        state.printerFailingSince.set(printerName, since);
+        if (stationPrintTarget(since, Date.now()) === 'station') {
+          // Ainda dentro do prazo: pode ser só a troca da bobina. A próxima volta tenta de novo.
+          allOk = false;
+          setPrintError(`A via de ${station.name} do pedido ${orderDisplayNumber(order)} não saiu na impressora "${printerName}" — se ela não voltar, a via sai na do caixa`);
+          notifyPrintFailure(order, `A via de ${station.name} não saiu na impressora "${printerName}"`);
+          continue;
+        }
+        try {
+          await sendLayoutToPrinter(cashierPrinter, ticket(true), cfg);
+          done.add(station.id);
+          wentToCashier = true;
+          setPrintError(`A impressora "${printerName}" (${station.name}) não respondeu — a via do pedido ${orderDisplayNumber(order)} saiu na impressora do caixa`);
+        } catch (err) {
+          console.error(`Erro ao imprimir a via de ${station.name} no caixa:`, err);
+          allOk = false;
+          setPrintError(`A via de ${station.name} do pedido ${orderDisplayNumber(order)} não saiu nem na impressora do caixa — verifique as impressoras`);
+          notifyPrintFailure(order, `A via de ${station.name} não saiu em nenhuma impressora`);
+        }
+      }
+      if (!allOk) return false;
+      // O aviso de "saiu no caixa" fica na tela (alguém precisa levar a via e ver a
+      // impressora); sem isso, some o aviso de uma via que falhou e agora saiu.
+      if (!wentToCashier) setPrintError(null);
+      return finish();
+    } catch (err) {
+      // Qualquer surpresa aqui não pode custar a comanda: a do caixa já saiu.
+      console.error('Erro inesperado nas vias dos setores:', err);
+      return finish();
     }
   };
 
@@ -2535,6 +3081,52 @@ function App() {
     return {
       ok: true,
       message: `Comanda de teste enviada para "${printerName}". Confira no papel: pedido #${testOrder.order_number}, ${nomes}. Ela sai marcada como TESTE — não produza.`,
+    };
+  };
+
+  /**
+   * TESTE DE UMA IMPRESSORA DE SETOR — o botão "Testar" ao lado de cada cadastro.
+   *
+   * Sai o que aquela impressora vai receber de verdade: a VIA DO SETOR (ou o pedido completo,
+   * se o cadastro é "pedido completo") do mesmo pedido simulado da comanda de teste, pelo
+   * MESMO caminho das vias reais (`sendLayoutToPrinter`). Marcada como TESTE; nunca vai ao
+   * servidor nem à fila.
+   */
+  const printStationTest = async (station: PrintStation, printerName: string): Promise<{ ok: boolean; message: string }> => {
+    if (!store) return { ok: false, message: 'Nenhuma loja carregada — faça login novamente.' };
+    if (!printerName) return { ok: false, message: `Escolha a impressora de ${station.name} antes de testar.` };
+    let products: TestOrderProduct[] = [];
+    try {
+      const { data, error } = await supabase
+        .from('products')
+        .select('name, price, product_config, complements')
+        .eq('store_id', store.id)
+        .eq('is_active', true)
+        .eq('is_available', true)
+        .is('deleted_at', null)
+        .limit(40);
+      if (error) throw error;
+      products = (data as TestOrderProduct[]) || [];
+    } catch (err) {
+      console.warn('Nao consegui ler o cardapio para o teste do setor:', err);
+    }
+    const testOrder = buildTestOrder(products, new Date()) as unknown as Order;
+    const cfg = printConfigRef.current;
+    try {
+      const blocks = station.fullReceipt
+        ? buildFullStationLayout(testOrder, store, cfg, station)
+        : buildOrderStationLayout(testOrder, store, station, testOrder.items || []);
+      await sendLayoutToPrinter(printerName, blocks, cfg);
+    } catch (err) {
+      console.error('Erro no teste da impressora do setor:', err);
+      return {
+        ok: false,
+        message: `Não consegui imprimir em "${printerName}". Confira se ela está ligada, com papel e escolhida em ${station.name}.`,
+      };
+    }
+    return {
+      ok: true,
+      message: `Teste de ${station.name} enviado para "${printerName}". Ele sai marcado como TESTE — não produza.`,
     };
   };
 
@@ -2896,6 +3488,7 @@ function App() {
     seenOrderIdsRef.current = new Set();
     printedOrderIdsRef.current = new Set();
     printedViasRef.current = new Map();
+    stationPrintStateRef.current = newStationPrintState();
     printedViasStoreIdRef.current = '';
     baselineDoneRef.current = false;
     activeOrdersRef.current = new Map();
@@ -3021,12 +3614,12 @@ function App() {
                 : updateCheck.state === 'checking'
                 ? 'Verificando…'
                 : updateCheck.state === 'up-to-date'
-                  ? `v${appVersion} · atualizado`
+                  ? `v${appVersion}${APP_FLAVOR_LABEL} · atualizado`
                   : updateCheck.state === 'error'
                     ? 'Não consegui verificar'
                     : updateInfo
-                      ? `v${appVersion} · atualização disponível`
-                      : `v${appVersion || '—'}`}
+                      ? `v${appVersion}${APP_FLAVOR_LABEL} · atualização disponível`
+                      : `v${appVersion || '—'}${APP_FLAVOR_LABEL}`}
             </button>
           </div>
           
@@ -3137,6 +3730,43 @@ function App() {
               <X className="w-4 h-4" />
             </button>
           </div>
+        </div>
+      )}
+
+      {/* IMPRESSORAS POR SETOR: cadastro do painel sem impressora escolhida neste computador. */}
+      {stationsWithoutChoice.length > 0 && (
+        <div className="bg-amber-900/60 border-b border-amber-500 text-amber-100 px-6 py-2 flex items-center justify-between text-sm">
+          <span className="flex items-center gap-2">
+            <Printer className="w-4 h-4" />
+            Escolha a impressora de: {stationsWithoutChoice.map((station) => station.name).join(', ')}. Enquanto isso, esses itens saem só no pedido completo do caixa.
+          </span>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="bg-amber-600 hover:bg-amber-700 text-white font-medium px-3 py-1 rounded-lg"
+          >
+            Abrir Configurações
+          </button>
+        </div>
+      )}
+
+      {/* CUPOM FISCAL: o que impede ESTE computador de imprimir (só na loja com a nota ligada).
+          Fixo, uma vez — sem notificação. Sem escolha, este PC não imprime (o painel cobre). */}
+      {fiscalPrintEnabled && (fiscalPrintChoiceMissing || fiscalPrinterMissing || (settings.fiscalPrintHere === true && fiscalNotice)) && (
+        <div className="bg-amber-900/60 border-b border-amber-500 text-amber-100 px-6 py-2 flex items-center justify-between text-sm">
+          <span className="flex items-center gap-2">
+            <Printer className="w-4 h-4" />
+            {fiscalPrintChoiceMissing
+              ? FISCAL_BLOCK_NOTICES.not_chosen
+              : fiscalPrinterMissing
+                ? FISCAL_BLOCK_NOTICES.no_printer
+                : fiscalNotice}
+          </span>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="bg-amber-600 hover:bg-amber-700 text-white font-medium px-3 py-1 rounded-lg"
+          >
+            Abrir Configurações
+          </button>
         </div>
       )}
 
@@ -3278,10 +3908,13 @@ function App() {
         <SettingsModal
           settings={settings}
           store={store!}
+          fiscalPrintEnabled={fiscalPrintEnabled}
+          printStations={printConfig.stations}
           onClose={() => setShowSettings(false)}
           onSave={setSettings}
           onLogout={() => setConfirmLogout(true)}
           onTestPrint={printTestReceipt}
+          onTestStation={printStationTest}
         />
       )}
 
@@ -3714,21 +4347,35 @@ function OrderDetails({
 }
 
 // Settings Modal Component
+// Valores do seletor de impressora de um setor que NÃO são impressora (nomes que nenhuma
+// impressora do Windows tem).
+const STATION_PRINTER_UNSET = '__kyberfood_sem_escolha__';
+const STATION_PRINTER_OFF = '__kyberfood_nao_imprimir__';
+
 function SettingsModal({
   settings,
   store,
+  fiscalPrintEnabled,
   onClose,
   onSave,
   onLogout,
   onTestPrint,
+  printStations,
+  onTestStation,
 }: {
   settings: Settings;
   store: Store;
+  /** A nota está ligada na loja: só então a opção do cupom fiscal aparece. */
+  fiscalPrintEnabled: boolean;
   onClose: () => void;
   onSave: (settings: Settings) => void;
   onLogout: () => void;
   /** Imprime a comanda de TESTE e devolve o que mostrar na tela. Ver `printTestReceipt`. */
   onTestPrint: (printerName: string) => Promise<{ ok: boolean; message: string }>;
+  /** Impressoras por setor cadastradas no painel. Vazio = a seção nem aparece. */
+  printStations: PrintStation[];
+  /** Imprime o teste de UMA impressora de setor. Ver `printStationTest`. */
+  onTestStation: (station: PrintStation, printerName: string) => Promise<{ ok: boolean; message: string }>;
 }) {
   const [localSettings, setLocalSettings] = useState(settings);
   const [systemPrinters, setSystemPrinters] = useState<{name: string, is_default: boolean}[]>([]);
@@ -3761,6 +4408,40 @@ function SettingsModal({
   }, []);
 
   useEffect(() => { void fetchPrinters(); }, [fetchPrinters]);
+
+  // IMPRESSORAS POR SETOR: o teste de cada uma tem o próprio estado (qual está imprimindo e o
+  // resultado de qual), separado do teste da impressora do caixa.
+  const [testingStationId, setTestingStationId] = useState<string | null>(null);
+  const [stationTestResult, setStationTestResult] = useState<{ stationId: string; ok: boolean; message: string } | null>(null);
+
+  const setStationPrinter = (stationId: string, value: string) => {
+    setLocalSettings((s) => {
+      const next = { ...(s.stationPrinters || {}) };
+      // "Sem escolha" APAGA a chave (o app volta a avisar); "não imprimir aqui" grava vazio.
+      if (value === STATION_PRINTER_UNSET) delete next[stationId];
+      else next[stationId] = value === STATION_PRINTER_OFF ? '' : value;
+      return { ...s, stationPrinters: next };
+    });
+    setStationTestResult(null);
+  };
+
+  const handleStationTest = async (station: PrintStation) => {
+    const choice = stationPrinterChoice(localSettings.stationPrinters, station.id);
+    if (testingStationId || choice.state !== 'printer') return;
+    setTestingStationId(station.id);
+    setStationTestResult(null);
+    try {
+      // Como no teste do caixa: testar uma impressora É escolhê-la, e só ela é salva.
+      onSave({ ...settings, stationPrinters: { ...(settings.stationPrinters || {}), [station.id]: choice.printerName } });
+      const result = await onTestStation(station, choice.printerName);
+      setStationTestResult({ stationId: station.id, ...result });
+    } catch (err) {
+      console.error('Erro no teste da impressora do setor:', err);
+      setStationTestResult({ stationId: station.id, ok: false, message: 'Não consegui falar com a impressora. Tente de novo.' });
+    } finally {
+      setTestingStationId(null);
+    }
+  };
 
   const handleTestPrint = async () => {
     if (testing) return;
@@ -3843,8 +4524,49 @@ function SettingsModal({
             </button>
           </div>
 
+          {/* CUPOM FISCAL POR COMPUTADOR. Só aparece na loja com a nota ligada (loja sem nota não
+              vê nada fiscal). NASCE SEM ESCOLHA: com dois PCs o cupom sairia no primeiro que pegasse,
+              então o lojista escolhe aqui, PC a PC, e até escolher este não imprime. */}
+          {fiscalPrintEnabled && (
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <Printer className="w-5 h-5" />
+                <span>Imprimir cupom fiscal neste computador</span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setLocalSettings(s => ({ ...s, fiscalPrintHere: true }))}
+                  className={`flex-1 py-2 rounded-lg border text-sm font-medium ${
+                    localSettings.fiscalPrintHere === true ? 'bg-orange-600 border-orange-500 text-white' : 'bg-gray-700 border-gray-600 text-gray-200'
+                  }`}
+                >
+                  Sim, imprime aqui
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLocalSettings(s => ({ ...s, fiscalPrintHere: false }))}
+                  className={`flex-1 py-2 rounded-lg border text-sm font-medium ${
+                    localSettings.fiscalPrintHere === false ? 'bg-orange-600 border-orange-500 text-white' : 'bg-gray-700 border-gray-600 text-gray-200'
+                  }`}
+                >
+                  Não imprime aqui
+                </button>
+              </div>
+              {localSettings.fiscalPrintHere === undefined && (
+                <p className="text-xs text-amber-300 mt-2">{FISCAL_BLOCK_NOTICES.not_chosen}.</p>
+              )}
+              <p className="text-xs text-gray-400 mt-1">
+                Se a loja tem mais de um computador, deixe ligado só no do caixa: o cupom sai uma
+                vez só, no primeiro computador que pegar.
+              </p>
+            </div>
+          )}
+
           <div className="border-t border-gray-700 pt-4">
-            <label className="block text-sm text-gray-400 mb-2 font-medium">Impressora do Sistema</label>
+            <label className="block text-sm text-gray-400 mb-2 font-medium">
+              {printStations.length > 0 ? 'Impressora do Caixa (pedido completo)' : 'Impressora do Sistema'}
+            </label>
             <div className="flex gap-2">
               <select
                 value={localSettings.selectedPrinter}
@@ -3925,6 +4647,77 @@ function SettingsModal({
               </div>
             )}
           </div>
+
+          {/* IMPRESSORAS POR SETOR: só aparece na loja que cadastrou alguma no painel. */}
+          {printStations.length > 0 && (
+            <div className="border-t border-gray-700 pt-4">
+              <label className="block text-sm text-gray-400 mb-1 font-medium">Impressoras por setor</label>
+              <p className="text-xs text-gray-400 mb-3">
+                Diga qual impressora <span className="text-gray-300 font-medium">deste computador</span> é
+                cada uma. A do Caixa, acima, continua imprimindo o pedido completo.
+              </p>
+              <div className="space-y-3">
+                {printStations.map((station) => {
+                  const choice = stationPrinterChoice(localSettings.stationPrinters, station.id);
+                  const value = choice.state === 'printer'
+                    ? choice.printerName
+                    : choice.state === 'off' ? STATION_PRINTER_OFF : STATION_PRINTER_UNSET;
+                  const missing = choice.state === 'printer' && !systemPrinters.some((p) => p.name === choice.printerName);
+                  return (
+                    <div key={station.id}>
+                      <p className="text-sm text-gray-200 mb-1">
+                        {station.name}{' '}
+                        <span className="text-xs text-gray-400">
+                          ({station.fullReceipt ? 'pedido completo' : 'só os itens dela'})
+                        </span>
+                      </p>
+                      <div className="flex gap-2">
+                        <select
+                          value={value}
+                          onChange={(e) => setStationPrinter(station.id, e.target.value)}
+                          className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white focus:border-orange-500 focus:outline-none"
+                          disabled={loadingPrinters}
+                        >
+                          <option value={STATION_PRINTER_UNSET}>Escolha uma impressora</option>
+                          <option value={STATION_PRINTER_OFF}>Não imprimir neste computador</option>
+                          {missing && choice.state === 'printer' && (
+                            <option value={choice.printerName}>{choice.printerName} (não encontrada)</option>
+                          )}
+                          {systemPrinters.map((p) => (
+                            <option key={p.name} value={p.name}>{p.name}</option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => void handleStationTest(station)}
+                          disabled={testingStationId !== null || choice.state !== 'printer'}
+                          className="flex items-center gap-2 bg-orange-600 hover:bg-orange-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white font-semibold px-3 py-2 rounded-lg"
+                        >
+                          {testingStationId === station.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
+                          Testar
+                        </button>
+                      </div>
+                      {choice.state === 'unset' && (
+                        <p className="text-xs text-amber-300 mt-1">Sem escolha: os itens saem só no pedido completo do caixa.</p>
+                      )}
+                      {missing && (
+                        <p className="text-xs text-red-400 mt-1">Esta impressora não está mais no Windows. Escolha outra.</p>
+                      )}
+                      {stationTestResult && stationTestResult.stationId === station.id && (
+                        <p className={`text-xs mt-1 ${stationTestResult.ok ? 'text-green-300' : 'text-red-300'}`}>
+                          {stationTestResult.message}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-gray-400 mt-3">
+                Se uma impressora de setor ficar sem responder, a via dela sai na do Caixa com um aviso.
+                Os nomes e as categorias de cada uma são definidos no painel, em Integrações → Configurar impressão.
+              </p>
+            </div>
+          )}
 
           <div className="border-t border-gray-700 pt-4">
             <p className="text-xs text-gray-400">
@@ -4313,6 +5106,58 @@ function buildReceiptLayout(order: Order, store: Store, config: PrintConfig): Re
 // ESPELHA encodeReceiptLayout do app web.
 function encodeReceiptLayout(blocks: ReceiptBlock[]): string {
   return JSON.stringify({ blocks });
+}
+
+// Os ajudantes e rótulos da comanda do caixa, entregues à via do setor: é o que mantém as
+// duas com o MESMO tamanho limpo, a mesma fração de sabor e a mesma trava anti-forja.
+// ESPELHA STATION_TICKET_DEPS de src/lib/desktop-print-config.ts.
+const STATION_TICKET_DEPS: StationTicketDeps = {
+  clean: stripControlChars,
+  sizeLabel: receiptSizeLabel,
+  isFlavorComplement,
+  scheduledLabel: SCHEDULED_RECEIPT_LABEL,
+  orderNotesLabel: ORDER_NOTES_RECEIPT_LABEL,
+  itemNotePrefix: ITEM_NOTE_RECEIPT_PREFIX,
+};
+
+// A VIA DE UM SETOR para um pedido: só os `items` daquele setor, sem preço nem endereço.
+// `outage` = a via está saindo no CAIXA porque a impressora do setor não respondeu.
+// ESPELHA buildOrderStationLayout de src/lib/desktop-print-config.ts.
+function buildOrderStationLayout(
+  order: Order,
+  store: Store,
+  station: PrintStation,
+  items: StationTicketItem[],
+  outage = false,
+): ReceiptBlock[] {
+  return buildStationTicketLayout(
+    {
+      stationName: station.name,
+      typeLabel: receiptOrderTypeLabel(order),
+      orderLabel: `PEDIDO #${orderDisplayNumber(order)}`,
+      dateTimeText: formatOrderDateTime(order.created_at, store.timezone),
+      scheduledText: order.scheduled_at ? formatOrderDateTime(order.scheduled_at, store.timezone) : null,
+      customerName: receiptCustomerName(order.customer_name),
+      items,
+      orderNotes: order.notes,
+      outage,
+    },
+    STATION_TICKET_DEPS,
+  );
+}
+
+// O PEDIDO COMPLETO que sai numa impressora cadastrada como "pedido completo": o MESMO
+// documento do caixa; com `outage`, leva o aviso no topo.
+// ESPELHA buildFullStationLayout de src/lib/desktop-print-config.ts.
+function buildFullStationLayout(
+  order: Order,
+  store: Store,
+  config: PrintConfig,
+  station: PrintStation,
+  outage = false,
+): ReceiptBlock[] {
+  const blocks = buildReceiptLayout(order, store, config);
+  return outage ? [...stationOutageBlocks(station.name), ...blocks] : blocks;
 }
 
 // A comanda linha a linha, no formato do modo TEXTO — derivada do documento de blocos.

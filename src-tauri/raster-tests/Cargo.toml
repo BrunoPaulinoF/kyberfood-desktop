@@ -1,0 +1,29 @@
+# Crate SÓ DE TESTE do modo gráfico (`../src/receipt_raster.rs`): comanda e cupom fiscal.
+#
+# POR QUE EXISTE: o app (`../Cargo.toml`) depende do Tauri, que não compila sem as bibliotecas
+# do webview (gdk-3.0 & cia.) — então `cargo test` no app não roda aqui nem no CI do monorepo.
+# Este crate inclui SÓ o `receipt_raster.rs` (por `#[path]`, o MESMO arquivo, sem cópia) com as
+# MESMAS versões das dependências do `../Cargo.lock`, e roda os testes dele:
+#
+#   cd kyberfood-desktop/src-tauri/raster-tests && cargo test
+#
+# FORA DO BUILD DO APP: `[workspace]` próprio (o cargo não sobe até o pacote do app procurando
+# workspace), o app não o declara como membro nem dependência, e o instalador (tauri-action em
+# `kyberfood-desktop/src-tauri`) nunca o compila. `target/` está no .gitignore do app.
+
+[package]
+name = "kyberfood-raster-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Fixadas nas versões do ../Cargo.lock: o teste mede o código que o app compila.
+ab_glyph = "=0.2.32"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
