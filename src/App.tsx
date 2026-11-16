@@ -72,6 +72,7 @@ import {
   saveSavedCredentials,
   type SavedCredentials,
 } from './credential-vault';
+import { onSessionUnlockedLate, sessionVaultStorage } from './session-vault';
 import { getVersion } from '@tauri-apps/api/app';
 import { open as openExternal } from '@tauri-apps/api/shell';
 import { checkUpdate, installUpdate } from '@tauri-apps/api/updater';
@@ -1325,6 +1326,10 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     autoRefreshToken: true,
     detectSessionInUrl: false,
     storageKey: AUTH_STORAGE_KEY,
+    // A sessão (access + refresh token) vai ao disco CIFRADA pela DPAPI do Windows, e não
+    // mais em claro no localStorage. O cofre lê o valor em claro que já existe, migra
+    // sozinho e, em qualquer falha de cifra, grava como antes — ver `session-vault.ts`.
+    storage: sessionVaultStorage,
     // Lock EM MEMÓRIA (processLock) no lugar do navigator.locks padrão: o
     // navigator.locks podia DEADLOCKAR ao reabrir o app após sair pela bandeja,
     // travando getSession/refresh e, com eles, a tela de "Conectando…" para
@@ -3412,9 +3417,22 @@ function App() {
       setTimeout(() => { if (active) ensureStoreLoaded(userId); }, 0);
     });
 
+    // A sessão guardada não abriu na leitura (cifra do Windows indisponível naquele
+    // instante) e abriu DEPOIS, em segundo plano: o supabase-js não emite evento nenhum
+    // nesse caso, então é aqui que o app volta a ficar conectado, sem ninguém digitar nada.
+    const stopLateUnlock = onSessionUnlockedLate(() => {
+      if (!active || loggingOutRef.current) return;
+      void supabase.auth.getSession().then(({ data: { session } }) => {
+        if (!active || loggingOutRef.current || !session?.user) return;
+        supabase.realtime.setAuth(session.access_token);
+        void ensureStoreLoaded(session.user.id);
+      }).catch(() => {});
+    });
+
     return () => {
       active = false;
       clearTimeout(splashTimer);
+      stopLateUnlock();
       subscription.unsubscribe();
     };
   }, [loadStoreForUser, attemptAutoRelogin]);
