@@ -1191,6 +1191,16 @@ const AUTH_STORAGE_KEY = 'kyberfood.desktop.auth';
  * significa 10 batidas de folga antes de a IA parar de atender.
  */
 const HEARTBEAT_INTERVAL_MS = 30_000;
+/**
+ * Intervalo MÍNIMO entre duas batidas que não são retentativa. Foco, volta da internet, volta
+ * da aba, detector de suspensão e o efeito sendo remontado podem disparar batidas seguidas; no
+ * incidente de 17/11/2026 um app em laço mandou mais de mil por minuto e ajudou a derrubar o
+ * site de todas as lojas. Com esta trava, por mais que os gatilhos disparem, sai no máximo uma a
+ * cada 5 s (o servidor tem o MESMO freio, `desktop-heartbeat-throttle.ts`).
+ */
+const HEARTBEAT_MIN_GAP_MS = 5_000;
+/** Idem para a varredura da fila de impressão do painel: no máximo uma a cada 3 s. */
+const PRINT_JOB_SWEEP_MIN_GAP_MS = 3_000;
 
 /**
  * FREIO DO RELOGIN AUTOMÁTICO — o teto que faltava no caminho de SUCESSO.
@@ -1460,6 +1470,10 @@ function App() {
   // nem mostra a opção nas Configurações.
   const [fiscalPrintEnabled, setFiscalPrintEnabled] = useState(false);
   const fiscalPrintEnabledRef = useRef(false);
+  // Fora dos efeitos de propósito: sobrevivem ao efeito ser remontado (é justamente a remontagem
+  // em sequência que dispararia batidas e varreduras em rajada).
+  const lastHeartbeatAtRef = useRef(0);
+  const lastPrintSweepAtRef = useRef(0);
   // Bloqueio do cupom fiscal que só aparece num job (bobina menor, impressora sumida): UM aviso
   // fixo na tela, sem notificação a cada volta.
   const [fiscalNotice, setFiscalNotice] = useState<string | null>(null);
@@ -1789,6 +1803,12 @@ function App() {
 
     const sendHeartbeat = async (attempt = 0) => {
       if (cancelled) return;
+      // Trava contra rajada: batida nova (não retentativa) a menos de 5 s da anterior não sai.
+      if (attempt === 0) {
+        const agora = Date.now();
+        if (agora - lastHeartbeatAtRef.current < HEARTBEAT_MIN_GAP_MS) return;
+        lastHeartbeatAtRef.current = agora;
+      }
       try {
         // Pelo cliente nativo (httpJson): é ESTE heartbeat que mantém a IA atendendo, e
         // um bloqueio de CORS aqui deixaria a loja "offline" para o servidor sem nenhum
@@ -2370,6 +2390,10 @@ function App() {
     // é o mesmo motivo do polling de pedidos). Só o que ainda está pendente e recente.
     const sweep = async () => {
       if (disposed) return;
+      // Trava contra rajada (ver `PRINT_JOB_SWEEP_MIN_GAP_MS`); o realtime continua entregando.
+      const agora = Date.now();
+      if (agora - lastPrintSweepAtRef.current < PRINT_JOB_SWEEP_MIN_GAP_MS) return;
+      lastPrintSweepAtRef.current = agora;
       try {
         const since = new Date(Date.now() - PRINT_JOB_MAX_AGE_MS).toISOString();
         const { data, error } = await supabase
