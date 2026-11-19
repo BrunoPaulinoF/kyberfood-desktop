@@ -73,6 +73,7 @@ import {
   type SavedCredentials,
 } from './credential-vault';
 import { onSessionUnlockedLate, sessionVaultStorage } from './session-vault';
+import { createLoopGate, shareInFlight, withDeadline } from './burst-guard';
 import { getVersion } from '@tauri-apps/api/app';
 import { open as openExternal } from '@tauri-apps/api/shell';
 import { checkUpdate, installUpdate } from '@tauri-apps/api/updater';
@@ -1201,6 +1202,12 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_MIN_GAP_MS = 5_000;
 /** Idem para a varredura da fila de impressão do painel: no máximo uma a cada 3 s. */
 const PRINT_JOB_SWEEP_MIN_GAP_MS = 3_000;
+/**
+ * Prazo da consulta da varredura. Ela vai direto ao Supabase, que espera o token por dentro:
+ * sem este sinal de cancelamento, a consulta presa sairia horas depois junto com as outras.
+ * Cancelada, ela é descartada antes de ir à rede quando o token enfim chega.
+ */
+const PRINT_JOB_SWEEP_DEADLINE_MS = 20_000;
 
 /**
  * FREIO DO RELOGIN AUTOMÁTICO — o teto que faltava no caminho de SUCESSO.
@@ -1369,9 +1376,21 @@ function getDeviceId(): string {
   }
 }
 
+/**
+ * Prazo para obter o token antes de uma chamada ao site. Sem internet, `getSession()` fica
+ * preso atrás da renovação da sessão (trava do supabase-js) — no incidente de 18/11/2026 o
+ * app da Tempero de Mãe ficou 4h30 assim e, quando a internet voltou, soltou de uma vez tudo
+ * o que tinha acumulado, e a Hostinger barrou o site de todas as lojas. Passado o prazo, a
+ * chamada desiste ANTES de sair: o token que chega atrasado não vira requisição.
+ */
+const AUTH_HEADERS_DEADLINE_MS = 15_000;
+
+// Chamadas simultâneas dividem o mesmo `getSession()`: preso, ele vira UM pendente, não um por tique.
+const readSessionShared = shareInFlight(() => supabase.auth.getSession());
+
 // A API web exige autenticação (cookie ou Bearer); o desktop envia o token da sessão Supabase.
 async function getAuthHeaders(): Promise<Record<string, string>> {
-  const { data: { session } } = await supabase.auth.getSession();
+  const { data: { session } } = await withDeadline(readSessionShared(), AUTH_HEADERS_DEADLINE_MS, 'token da sessão');
   return session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {};
 }
 
@@ -1474,6 +1493,12 @@ function App() {
   // em sequência que dispararia batidas e varreduras em rajada).
   const lastHeartbeatAtRef = useRef(0);
   const lastPrintSweepAtRef = useRef(0);
+  // UMA rodada por vez em cada laço (`burst-guard.ts`): rodada presa não deixa outra começar,
+  // então nada se acumula para sair em rajada quando a internet volta.
+  const heartbeatGateRef = useRef(createLoopGate());
+  const ordersPollGateRef = useRef(createLoopGate());
+  const printSweepGateRef = useRef(createLoopGate());
+  const sessionCheckGateRef = useRef(createLoopGate());
   // Bloqueio do cupom fiscal que só aparece num job (bobina menor, impressora sumida): UM aviso
   // fixo na tela, sem notificação a cada volta.
   const [fiscalNotice, setFiscalNotice] = useState<string | null>(null);
@@ -1807,8 +1832,11 @@ function App() {
       if (attempt === 0) {
         const agora = Date.now();
         if (agora - lastHeartbeatAtRef.current < HEARTBEAT_MIN_GAP_MS) return;
+        if (heartbeatGateRef.current.busy()) return;
         lastHeartbeatAtRef.current = agora;
       }
+      // Uma batida por vez: a anterior presa (esperando o token) não deixa outra começar.
+      if (!heartbeatGateRef.current.tryEnter()) return;
       try {
         // Pelo cliente nativo (httpJson): é ESTE heartbeat que mantém a IA atendendo, e
         // um bloqueio de CORS aqui deixaria a loja "offline" para o servidor sem nenhum
@@ -1865,6 +1893,8 @@ function App() {
         } else {
           setHeartbeatFailing(true);
         }
+      } finally {
+        heartbeatGateRef.current.leave();
       }
     };
 
@@ -2013,6 +2043,9 @@ function App() {
   // Na 1ª execução após o login estabelece a linha de base (não alerta o que já
   // existia), para não reimprimir pedidos antigos ao abrir o app.
   const syncFromServer = useCallback(async (storeId: string) => {
+    // Uma busca por vez: a anterior presa (esperando o token) não deixa outra começar; o
+    // próximo tique de 10 s pega o que esta pulou.
+    if (!ordersPollGateRef.current.tryEnter()) return;
     try {
       // Pelo cliente NATIVO (httpJson), nunca pelo fetch do webview: este polling é o
       // PILAR de recebimento de pedidos e o fetch do webview NÃO chega até aqui. A
@@ -2090,6 +2123,8 @@ function App() {
       setInProgressOrders(prev => (sameJson(prev, inProgress) ? prev : inProgress));
     } catch (err) {
       console.error('Erro ao sincronizar pedidos:', err);
+    } finally {
+      ordersPollGateRef.current.leave();
     }
   }, [processIncomingOrder]);
 
@@ -2393,6 +2428,8 @@ function App() {
       // Trava contra rajada (ver `PRINT_JOB_SWEEP_MIN_GAP_MS`); o realtime continua entregando.
       const agora = Date.now();
       if (agora - lastPrintSweepAtRef.current < PRINT_JOB_SWEEP_MIN_GAP_MS) return;
+      // Uma varredura por vez: a anterior presa (esperando o token) não deixa outra começar.
+      if (!printSweepGateRef.current.tryEnter()) return;
       lastPrintSweepAtRef.current = agora;
       try {
         const since = new Date(Date.now() - PRINT_JOB_MAX_AGE_MS).toISOString();
@@ -2403,7 +2440,8 @@ function App() {
           .eq('status', 'pending')
           .gte('created_at', since)
           .order('created_at', { ascending: true })
-          .limit(5);
+          .limit(5)
+          .abortSignal(AbortSignal.timeout(PRINT_JOB_SWEEP_DEADLINE_MS));
         if (error || !Array.isArray(data)) return;
         for (const job of data) {
           if (disposed) return;
@@ -2411,6 +2449,8 @@ function App() {
         }
       } catch (err) {
         console.warn('Falha ao varrer a fila de impressao:', err);
+      } finally {
+        printSweepGateRef.current.leave();
       }
     };
 
@@ -3367,11 +3407,15 @@ function App() {
   useEffect(() => {
     const check = async () => {
       if (loggingOutRef.current || !loadCredentials()) return;
+      // Uma checagem por vez: presa atrás da renovação da sessão, não empilha outra a cada minuto.
+      if (!sessionCheckGateRef.current.tryEnter()) return;
       try {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session) void attemptAutoRelogin();
       } catch {
         // Falha de rede: o próprio relogin (ou a próxima checagem) resolve.
+      } finally {
+        sessionCheckGateRef.current.leave();
       }
     };
     const id = setInterval(check, 60_000);
