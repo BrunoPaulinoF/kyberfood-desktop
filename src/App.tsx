@@ -471,6 +471,8 @@ export interface Order {
     } | null;
     /** 'pickup' | 'delivery' — tipo do pedido gravado na criação pelo app web. */
     order_type?: string | null;
+    /** `true` = retirada com pagamento "a combinar na retirada" (IA não perguntou). */
+    pickup_payment_undecided?: boolean | null;
     /** Mesa do pedido feito no salão (QR Code ou garçom). */
     table?: { id?: unknown; label?: unknown } | null;
     /** `false` = pedido do salão que vai SÓ para a tela da cozinha (sem comanda automática). */
@@ -536,7 +538,16 @@ function receiptSizeLabel(raw?: string | null): string | null {
 
 // Texto do pagamento do pedido: usa payment_types quando existir (dividido,
 // personalizado, troco); senão cai no payment_method cru (pedidos antigos).
+// Retirada em que a IA não perguntou o pagamento: o pedido está gravado como dinheiro (para o
+// PDV e o caixa), mas o cliente não escolheu — a comanda diz "a combinar". ESPELHO de
+// isPickupPaymentUndecided em src/lib/order-pickup.ts no app web — mudou lá, muda aqui.
+const PICKUP_PAYMENT_UNDECIDED_RECEIPT_LABEL = 'A COMBINAR NA RETIRADA';
+function isPickupPaymentUndecided(order: Order): boolean {
+  return order.metadata?.pickup_payment_undecided === true
+    && String(order.metadata?.order_type || '').trim().toLowerCase() === 'pickup';
+}
 function formatOrderPayments(order: Order): string {
+  if (isPickupPaymentUndecided(order)) return PICKUP_PAYMENT_UNDECIDED_RECEIPT_LABEL;
   const payments = order.metadata?.saipos?.payment_types;
   if (Array.isArray(payments) && payments.length > 0) {
     const showAmount = payments.length > 1;
